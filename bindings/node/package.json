@@ -1,0 +1,12 @@
+{
+  "name": "turboquant-mlx",
+  "version": "0.1.0",
+  "description": "TurboQuant near-lossless compression for Apple Silicon via MLX",
+  "main": "index.js",
+  "author": "Eugene Kovshilovsky",
+  "license": "MIT",
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  }
+}

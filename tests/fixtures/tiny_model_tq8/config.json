@@ -1,0 +1,16 @@
+{
+  "model_type": "test",
+  "hidden_size": 64,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "head_dim": 16,
+  "intermediate_size": 128,
+  "vocab_size": 256,
+  "quantization_config": {
+    "quantization_method": "turboquant",
+    "tq_version": "1",
+    "tq_primary_bits": 4,
+    "tq_residual_bits": 4,
+    "tq_total_bits": 8
+  }
+}

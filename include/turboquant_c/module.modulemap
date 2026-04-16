@@ -1,0 +1,4 @@
+module TurboQuantC {
+    header "turboquant_c.h"
+    export *
+}

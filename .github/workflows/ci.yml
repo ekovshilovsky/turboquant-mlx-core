@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install mlx
+
+      - name: CMake configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: CMake build
+        run: cmake --build build
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure -R "^unit_test_"
+
+      - name: Run integration tests
+        run: ctest --test-dir build --output-on-failure -R "^integration_test_"
+
+      - name: Run C API tests
+        run: ctest --test-dir build --output-on-failure -R "^c_api_test_"

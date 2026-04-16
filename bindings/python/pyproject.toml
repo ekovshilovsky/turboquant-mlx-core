@@ -1,0 +1,14 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "turboquant-mlx"
+version = "0.1.0"
+description = "TurboQuant near-lossless weight and KV cache compression for Apple Silicon via MLX"
+license = {text = "MIT"}
+authors = [{name = "Eugene Kovshilovsky"}]
+requires-python = ">=3.11"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
