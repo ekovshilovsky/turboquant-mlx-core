@@ -1,10 +1,11 @@
 #include "turboquant/distributed.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <algorithm>
-#include <cctype>
 
 namespace turboquant {
 
@@ -204,6 +205,48 @@ ShardPlan TQDistributedCoordinator::plan(int num_layers, int num_heads, int /*he
             int head_end   = (r + 1) * num_heads / world_size_;
             result.assignments.push_back({r, -1, -1, head_start, head_end});
         }
+    }
+
+    return result;
+}
+
+ShardPlan TQDistributedCoordinator::plan_memory_aware(
+    int num_layers, int /*num_heads*/, int /*head_dim*/,
+    const std::vector<NodeMemoryInfo>& nodes) {
+
+    ShardPlan result;
+    result.strategy = ShardStrategy::PipelineParallel;
+
+    if (nodes.empty() || num_layers <= 0) return result;
+    if (nodes.size() == 1) {
+        result.assignments.push_back({0, 0, num_layers, -1, -1});
+        return result;
+    }
+
+    // Sum usable memory across the cluster. Clamp the denominator so a
+    // degenerate all-zero input still produces a valid plan instead of NaN.
+    double total_mem = 0.0;
+    for (const auto& n : nodes) total_mem += n.usable_memory_gb;
+    if (total_mem <= 0.0) total_mem = 1.0;
+
+    // Assign layers proportional to usable memory. The final node receives
+    // whatever remains so the total is always exactly num_layers.
+    int assigned = 0;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        int rank = static_cast<int>(i);
+        int layers_for_node;
+        if (i + 1 == nodes.size()) {
+            layers_for_node = num_layers - assigned;
+        } else {
+            layers_for_node = static_cast<int>(
+                std::round(static_cast<double>(num_layers) * nodes[i].usable_memory_gb / total_mem));
+            if (layers_for_node < 1) layers_for_node = 1;
+            if (assigned + layers_for_node > num_layers) {
+                layers_for_node = num_layers - assigned;
+            }
+        }
+        result.assignments.push_back({rank, assigned, assigned + layers_for_node, -1, -1});
+        assigned += layers_for_node;
     }
 
     return result;

@@ -192,6 +192,53 @@ static void test_single_node_fallback() {
 // Entry point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Memory-aware shard planning
+// ---------------------------------------------------------------------------
+
+static void test_memory_proportional_assignment() {
+    // Three heterogeneous nodes; layers are assigned proportional to memory.
+    // Total usable: 146 GB. Shares: m5-max=113/146 → ~50, m4-pro=14/146 → ~6,
+    // m1-pro=19/146 → ~8. The last node absorbs any rounding residue.
+    TQDistributedCoordinator coord;
+    coord.init_local();
+
+    std::vector<NodeMemoryInfo> nodes = {
+        {"m5-max", 113.0},
+        {"m4-pro",  14.0},
+        {"m1-pro",  19.0},
+    };
+
+    auto plan = coord.plan_memory_aware(64, 28, 128, nodes);
+    assert(plan.strategy == ShardStrategy::PipelineParallel);
+    assert(plan.assignments.size() == 3);
+
+    int total = 0;
+    for (const auto& a : plan.assignments) {
+        total += (a.layer_end - a.layer_start);
+    }
+    assert(total == 64 && "All layers must be assigned");
+
+    // The largest-memory node must receive the largest share.
+    assert(plan.assignments[0].layer_end - plan.assignments[0].layer_start >= 40);
+    printf("  PASS: memory proportional assignment\n");
+}
+
+static void test_single_node_gets_all_layers() {
+    TQDistributedCoordinator coord;
+    coord.init_local();
+
+    std::vector<NodeMemoryInfo> nodes = {
+        {"m5-max", 113.0},
+    };
+
+    auto plan = coord.plan_memory_aware(64, 28, 128, nodes);
+    assert(plan.assignments.size() == 1);
+    assert(plan.assignments[0].layer_start == 0);
+    assert(plan.assignments[0].layer_end == 64);
+    printf("  PASS: single node gets all layers\n");
+}
+
 int main() {
     printf("test_distributed:\n");
     test_hostfile_parsing_valid();
@@ -202,6 +249,8 @@ int main() {
     test_single_node_plan();
     test_auto_strategy_selection();
     test_single_node_fallback();
+    test_memory_proportional_assignment();
+    test_single_node_gets_all_layers();
     printf("All distributed tests passed.\n");
     return 0;
 }

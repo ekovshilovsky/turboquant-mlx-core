@@ -14,6 +14,14 @@ struct NodeInfo {
     float link_latency_us;      ///< Measured link latency in microseconds
 };
 
+/// Minimal memory descriptor for proportional shard planning. Supplied by
+/// the coordinator once each prospective node has reported its usable memory
+/// (physical memory minus the OS + runtime headroom).
+struct NodeMemoryInfo {
+    std::string hostname;
+    double usable_memory_gb; ///< Available memory minus safety buffer
+};
+
 /// Parallelism strategy for distributed inference.
 enum class ShardStrategy {
     PipelineParallel,   ///< Split layers across nodes (best for high-latency links)
@@ -46,6 +54,13 @@ public:
 
     /// Analyze model + cluster topology to produce shard assignments.
     ShardPlan plan(int num_layers, int num_heads, int head_dim);
+
+    /// Memory-aware shard planning for heterogeneous clusters. Assigns
+    /// pipeline-parallel layer ranges proportional to each node's usable
+    /// memory. The last node absorbs any integer rounding residue so the
+    /// total number of assigned layers always equals num_layers.
+    ShardPlan plan_memory_aware(int num_layers, int num_heads, int head_dim,
+                                const std::vector<NodeMemoryInfo>& nodes);
 
     /// Execute distributed forward pass.
     mlx::core::array forward(const mlx::core::array& input);
