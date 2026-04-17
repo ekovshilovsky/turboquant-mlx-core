@@ -23,6 +23,7 @@ add_library(turboquant_mlx SHARED
   src/serialization.cpp
   src/turboquant_c.cpp
   src/turboquant_c_dequant.cpp
+  src/transport.cpp
 )
 target_include_directories(turboquant_mlx
   PUBLIC

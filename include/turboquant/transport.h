@@ -8,8 +8,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace turboquant {
+
+class TcpChannel;
 
 /// Maximum dimensions for a tensor in the wire protocol.
 static constexpr int kWireMaxDims = 8;
@@ -90,5 +93,73 @@ inline size_t wire_payload_bytes(const WireHeader& hdr) {
     }
     return elements * bytes_per_element;
 }
+
+/// Lightweight TCP listener for accepting incoming connections.
+/// Wraps POSIX socket bind/listen/accept for single-use server sockets.
+class TcpListener {
+public:
+    TcpListener();
+    ~TcpListener();
+
+    TcpListener(const TcpListener&) = delete;
+    TcpListener& operator=(const TcpListener&) = delete;
+
+    /// Bind to the given address on any available port. Returns the bound port,
+    /// or -1 on failure.
+    int bind_any(const char* addr);
+
+    /// Start listening with the given backlog.
+    void listen(int backlog);
+
+    /// Accept a single incoming connection. Blocks until a client connects.
+    TcpChannel accept();
+
+    /// Close the listener socket.
+    void close();
+
+private:
+    int fd_ = -1;
+};
+
+/// Bidirectional TCP channel for sending and receiving tensors.
+/// Wraps a connected POSIX socket with the TurboQuant wire protocol.
+class TcpChannel {
+public:
+    TcpChannel();
+    explicit TcpChannel(int fd);
+    ~TcpChannel();
+
+    TcpChannel(TcpChannel&& other) noexcept;
+    TcpChannel& operator=(TcpChannel&& other) noexcept;
+    TcpChannel(const TcpChannel&) = delete;
+    TcpChannel& operator=(const TcpChannel&) = delete;
+
+    /// Connect to a remote address and port. Returns true on success.
+    bool connect(const char* addr, int port);
+
+    /// Send a tensor: wire header followed by raw payload bytes.
+    bool send_tensor(const WireHeader& hdr, const uint8_t* payload);
+
+    /// Receive a tensor. The output vector is resized to hold the payload.
+    bool recv_tensor(WireHeader& hdr, std::vector<uint8_t>& recv_data);
+
+    /// Send a 1-byte ACK used for flow control.
+    bool send_ack();
+
+    /// Receive a 1-byte ACK. Blocks until received.
+    bool recv_ack();
+
+    /// Check if the channel holds an open socket.
+    bool is_connected() const;
+
+    /// Close the channel.
+    void close();
+
+private:
+    int fd_ = -1;
+
+    bool send_all(const void* data, size_t len);
+    bool recv_all(void* data, size_t len);
+};
 
 } // namespace turboquant
