@@ -135,6 +135,118 @@ static void test_tcp_ack() {
     printf("  PASS: tcp ack\n");
 }
 
+static void test_wire_uint8_roundtrip() {
+    // UInt8 is the expected dtype for opaque byte blobs such as serialized
+    // cache snapshots. Validates payload sizing for the uint8 branch.
+    WireHeader hdr;
+    hdr.ndim = 2;
+    hdr.shape[0] = 4;
+    hdr.shape[1] = 16;
+    hdr.dtype = WireDtype::UInt8;
+    hdr.sequence_id = 11;
+
+    uint8_t buf[kWireHeaderMaxBytes];
+    size_t sz = wire_header_encode(hdr, buf);
+
+    WireHeader decoded;
+    size_t consumed = wire_header_decode(buf, sz, decoded);
+    assert(consumed == sz);
+    assert(decoded.dtype == WireDtype::UInt8);
+    assert(decoded.shape[0] == 4);
+    assert(decoded.shape[1] == 16);
+    assert(wire_payload_bytes(decoded) == 64); // 4 * 16 * 1 byte
+    printf("  PASS: wire header uint8 roundtrip\n");
+}
+
+static void test_empty_tensor_roundtrip() {
+    // ndim=0 is a valid header-only transfer, used when a freshly joined
+    // node reports a snapshot that contains zero cached positions.
+    WireHeader hdr;
+    hdr.ndim = 0;
+    hdr.dtype = WireDtype::UInt8;
+    hdr.sequence_id = 5;
+
+    uint8_t buf[kWireHeaderMaxBytes];
+    size_t sz = wire_header_encode(hdr, buf);
+    assert(sz == 12); // 4 (ndim) + 0 (shape) + 4 (dtype) + 4 (seq_id)
+
+    WireHeader decoded;
+    size_t consumed = wire_header_decode(buf, sz, decoded);
+    assert(consumed == sz);
+    assert(decoded.ndim == 0);
+    assert(decoded.sequence_id == 5);
+    assert(wire_payload_bytes(decoded) == 0);
+
+    TcpListener listener;
+    int port = listener.bind_any("127.0.0.1");
+    listener.listen(1);
+
+    std::thread client_thread([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TcpChannel client;
+        client.connect("127.0.0.1", port);
+        bool sent = client.send_tensor(hdr, nullptr);
+        assert(sent);
+    });
+
+    TcpChannel server = listener.accept();
+    WireHeader recv_hdr;
+    std::vector<uint8_t> recv_data;
+    bool ok = server.recv_tensor(recv_hdr, recv_data);
+    assert(ok);
+    assert(recv_hdr.ndim == 0);
+    assert(recv_hdr.sequence_id == 5);
+    assert(recv_data.empty());
+
+    client_thread.join();
+    printf("  PASS: empty tensor roundtrip\n");
+}
+
+static void test_large_tcp_payload() {
+    // A 128 KB payload crosses typical kernel socket buffer boundaries and
+    // exercises the multi-iteration send_all / recv_all loops that small
+    // tests cannot reach. Byte-identity is verified to catch off-by-one and
+    // partial-read regressions ahead of snapshot transfers in Task 6.
+    const size_t kElements = 128 * 1024;
+    std::vector<uint8_t> payload(kElements);
+    for (size_t i = 0; i < kElements; ++i) {
+        payload[i] = static_cast<uint8_t>(i * 131u + 17u);
+    }
+
+    TcpListener listener;
+    int port = listener.bind_any("127.0.0.1");
+    listener.listen(1);
+
+    std::thread client_thread([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TcpChannel client;
+        client.connect("127.0.0.1", port);
+
+        WireHeader hdr;
+        hdr.ndim = 1;
+        hdr.shape[0] = static_cast<uint32_t>(kElements);
+        hdr.dtype = WireDtype::UInt8;
+        hdr.sequence_id = 77;
+        bool sent = client.send_tensor(hdr, payload.data());
+        assert(sent);
+    });
+
+    TcpChannel server = listener.accept();
+    WireHeader recv_hdr;
+    std::vector<uint8_t> recv_data;
+    bool ok = server.recv_tensor(recv_hdr, recv_data);
+    assert(ok);
+    assert(recv_hdr.ndim == 1);
+    assert(recv_hdr.shape[0] == kElements);
+    assert(recv_hdr.dtype == WireDtype::UInt8);
+    assert(recv_hdr.sequence_id == 77);
+    assert(recv_data.size() == kElements);
+    assert(std::memcmp(recv_data.data(), payload.data(), kElements) == 0);
+
+    client_thread.join();
+    printf("  PASS: large tcp payload byte-identity\n");
+}
+
 static void test_heartbeat_roundtrip() {
     Heartbeat hb;
     hb.rank = 2;
@@ -202,6 +314,9 @@ int main() {
     test_wire_header_1d_tensor();
     test_tcp_loopback_tensor();
     test_tcp_ack();
+    test_wire_uint8_roundtrip();
+    test_empty_tensor_roundtrip();
+    test_large_tcp_payload();
     test_heartbeat_roundtrip();
     test_heartbeat_over_tcp();
     printf("All transport tests passed.\n");
