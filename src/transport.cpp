@@ -181,4 +181,50 @@ bool TcpChannel::recv_all(void* data, size_t len) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+size_t heartbeat_encode(const Heartbeat& hb, uint8_t* buf) {
+    size_t pos = 0;
+    std::memcpy(buf + pos, &hb.rank, 4); pos += 4;
+    buf[pos++] = static_cast<uint8_t>(hb.state);
+    buf[pos++] = hb.low_memory ? 1 : 0;
+    std::memcpy(buf + pos, &hb.available_memory_gb, 4); pos += 4;
+    std::memcpy(buf + pos, &hb.layer_start, 4); pos += 4;
+    std::memcpy(buf + pos, &hb.layer_end, 4); pos += 4;
+    std::memcpy(buf + pos, &hb.tokens_processed, 8); pos += 8;
+    std::memcpy(buf + pos, &hb.avg_layer_ms, 4); pos += 4;
+    std::memcpy(buf + pos, &hb.syncing_percent, 4); pos += 4;
+    return pos;
+}
+
+size_t heartbeat_decode(const uint8_t* buf, size_t len, Heartbeat& hb) {
+    if (len < kHeartbeatBytes) return 0;
+    size_t pos = 0;
+    std::memcpy(&hb.rank, buf + pos, 4); pos += 4;
+    hb.state = static_cast<NodeStateCode>(buf[pos++]);
+    hb.low_memory = buf[pos++] != 0;
+    std::memcpy(&hb.available_memory_gb, buf + pos, 4); pos += 4;
+    std::memcpy(&hb.layer_start, buf + pos, 4); pos += 4;
+    std::memcpy(&hb.layer_end, buf + pos, 4); pos += 4;
+    std::memcpy(&hb.tokens_processed, buf + pos, 8); pos += 8;
+    std::memcpy(&hb.avg_layer_ms, buf + pos, 4); pos += 4;
+    std::memcpy(&hb.syncing_percent, buf + pos, 4); pos += 4;
+    return pos;
+}
+
+bool TcpChannel::send_heartbeat(const Heartbeat& hb) {
+    uint8_t buf[kHeartbeatBytes];
+    heartbeat_encode(hb, buf);
+    return send_all(buf, kHeartbeatBytes);
+}
+
+bool TcpChannel::recv_heartbeat(Heartbeat& hb) {
+    uint8_t buf[kHeartbeatBytes];
+    if (!recv_all(buf, kHeartbeatBytes)) return false;
+    heartbeat_decode(buf, kHeartbeatBytes, hb);
+    return true;
+}
+
 } // namespace turboquant

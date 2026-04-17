@@ -4,6 +4,7 @@
 #include "turboquant/transport.h"
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -134,6 +135,66 @@ static void test_tcp_ack() {
     printf("  PASS: tcp ack\n");
 }
 
+static void test_heartbeat_roundtrip() {
+    Heartbeat hb;
+    hb.rank = 2;
+    hb.state = NodeStateCode::Active;
+    hb.low_memory = false;
+    hb.available_memory_gb = 17.2f;
+    hb.layer_start = 30;
+    hb.layer_end = 49;
+    hb.tokens_processed = 14582;
+    hb.avg_layer_ms = 0.8f;
+    hb.syncing_percent = -1;
+
+    uint8_t buf[128];
+    size_t sz = heartbeat_encode(hb, buf);
+    assert(sz == kHeartbeatBytes);
+
+    Heartbeat decoded;
+    size_t consumed = heartbeat_decode(buf, sz, decoded);
+    assert(consumed == kHeartbeatBytes);
+
+    assert(decoded.rank == 2);
+    assert(decoded.state == NodeStateCode::Active);
+    assert(decoded.low_memory == false);
+    assert(std::abs(decoded.available_memory_gb - 17.2f) < 0.01f);
+    assert(decoded.layer_start == 30);
+    assert(decoded.layer_end == 49);
+    assert(decoded.tokens_processed == 14582u);
+    assert(decoded.syncing_percent == -1);
+    printf("  PASS: heartbeat roundtrip\n");
+}
+
+static void test_heartbeat_over_tcp() {
+    TcpListener listener;
+    int port = listener.bind_any("127.0.0.1");
+    listener.listen(1);
+
+    std::thread sender([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        TcpChannel ch;
+        ch.connect("127.0.0.1", port);
+
+        Heartbeat hb;
+        hb.rank = 1;
+        hb.state = NodeStateCode::Syncing;
+        hb.syncing_percent = 52;
+        ch.send_heartbeat(hb);
+    });
+
+    TcpChannel server = listener.accept();
+    Heartbeat recv_hb;
+    bool ok = server.recv_heartbeat(recv_hb);
+    assert(ok);
+    assert(recv_hb.rank == 1);
+    assert(recv_hb.state == NodeStateCode::Syncing);
+    assert(recv_hb.syncing_percent == 52);
+
+    sender.join();
+    printf("  PASS: heartbeat over tcp\n");
+}
+
 int main() {
     printf("test_transport:\n");
     test_wire_header_roundtrip();
@@ -141,6 +202,8 @@ int main() {
     test_wire_header_1d_tensor();
     test_tcp_loopback_tensor();
     test_tcp_ack();
+    test_heartbeat_roundtrip();
+    test_heartbeat_over_tcp();
     printf("All transport tests passed.\n");
     return 0;
 }

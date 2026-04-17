@@ -94,6 +94,46 @@ inline size_t wire_payload_bytes(const WireHeader& hdr) {
     return elements * bytes_per_element;
 }
 
+/// Node lifecycle state codes transmitted in heartbeat messages.
+/// Mirrors the distributed runtime's state machine: Discovered through Removed.
+enum class NodeStateCode : uint8_t {
+    Discovered   = 0,
+    Evaluating   = 1,
+    Rejected     = 2,
+    Syncing      = 3,
+    Loading      = 4,
+    Ready        = 5,
+    Active       = 6,
+    Disconnected = 7,
+    Draining     = 8,
+    Removed      = 9,
+};
+
+/// Heartbeat payload sent from every worker to the coordinator each second.
+/// Reports node health, state, memory pressure, current pipeline assignment,
+/// and sync progress.
+struct Heartbeat {
+    uint32_t rank = 0;
+    NodeStateCode state = NodeStateCode::Discovered;
+    bool low_memory = false;
+    float available_memory_gb = 0.0f;
+    int32_t layer_start = -1;
+    int32_t layer_end = -1;
+    uint64_t tokens_processed = 0;
+    float avg_layer_ms = 0.0f;
+    int32_t syncing_percent = -1; // -1 = not syncing, otherwise 0..100
+};
+
+/// Fixed heartbeat encoded size: 4 + 1 + 1 + 4 + 4 + 4 + 8 + 4 + 4 = 34 bytes.
+static constexpr size_t kHeartbeatBytes = 34;
+
+/// Encode a heartbeat into a byte buffer. Returns bytes written (kHeartbeatBytes).
+size_t heartbeat_encode(const Heartbeat& hb, uint8_t* buf);
+
+/// Decode a heartbeat from a byte buffer. Returns bytes consumed, or 0 if the
+/// buffer is shorter than kHeartbeatBytes.
+size_t heartbeat_decode(const uint8_t* buf, size_t len, Heartbeat& hb);
+
 /// Lightweight TCP listener for accepting incoming connections.
 /// Wraps POSIX socket bind/listen/accept for single-use server sockets.
 class TcpListener {
@@ -148,6 +188,12 @@ public:
 
     /// Receive a 1-byte ACK. Blocks until received.
     bool recv_ack();
+
+    /// Send a heartbeat message (fixed kHeartbeatBytes wire size).
+    bool send_heartbeat(const Heartbeat& hb);
+
+    /// Receive a heartbeat message.
+    bool recv_heartbeat(Heartbeat& hb);
 
     /// Check if the channel holds an open socket.
     bool is_connected() const;
