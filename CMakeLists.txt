@@ -24,6 +24,7 @@ add_library(turboquant_mlx SHARED
   src/turboquant_c.cpp
   src/turboquant_c_dequant.cpp
   src/transport.cpp
+  src/node_state.cpp
 )
 target_include_directories(turboquant_mlx
   PUBLIC
