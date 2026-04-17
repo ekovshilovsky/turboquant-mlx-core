@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace turboquant {
@@ -392,5 +393,204 @@ void TQKVCache::clear() {
 }
 
 const KVCacheConfig& TQKVCache::config() const { return config_; }
+
+// ---------------------------------------------------------------------------
+// Snapshot + delta
+// ---------------------------------------------------------------------------
+//
+// Per-layer blob layout (used for both full snapshots and deltas):
+//   num_tokens (uint32)
+//   key_indices_bytes (uint32) + raw uint32 packed key indices
+//   value_indices_bytes (uint32) + raw uint32 packed value indices
+//   key_norms_bytes (uint32) + raw float32 key norms
+//   value_norms_bytes (uint32) + raw float32 value norms
+//   qjl_signs_bytes (uint32) + raw uint32 QJL sign words
+//   qjl_norms_bytes (uint32) + raw float32 QJL residual norms
+//
+// Because the append path writes one contiguous group of words per token
+// (ceil(head_dim/10) key index words, num_heads norms, etc.), restricting a
+// blob to positions [from, to) is a simple strided copy — no bit surgery.
+
+namespace {
+
+// Per-token stride in uint32 words for packed indices: ceil(head_dim/10) per head.
+inline size_t packed_index_words_per_token(int num_heads, int head_dim) {
+    return static_cast<size_t>(num_heads) * static_cast<size_t>((head_dim + 9) / 10);
+}
+
+// Per-token stride in uint32 words for QJL signs: ceil(head_dim/32) per head.
+inline size_t qjl_sign_words_per_token(int num_heads, int head_dim) {
+    return static_cast<size_t>(num_heads) * static_cast<size_t>((head_dim + 31) / 32);
+}
+
+// Per-token norm count: one float per head.
+inline size_t norms_per_token(int num_heads) {
+    return static_cast<size_t>(num_heads);
+}
+
+inline void append_u32(std::vector<uint8_t>& out, uint32_t v) {
+    const size_t pos = out.size();
+    out.resize(pos + 4);
+    std::memcpy(out.data() + pos, &v, 4);
+}
+
+template <typename T>
+inline void append_span(std::vector<uint8_t>& out, const T* data, size_t count) {
+    const uint32_t bytes = static_cast<uint32_t>(count * sizeof(T));
+    append_u32(out, bytes);
+    if (bytes == 0) return;
+    const size_t pos = out.size();
+    out.resize(pos + bytes);
+    std::memcpy(out.data() + pos, data, bytes);
+}
+
+template <typename T>
+inline bool read_span(const std::vector<uint8_t>& blob, size_t& pos,
+                      std::vector<T>& dst, bool append_mode) {
+    if (pos + 4 > blob.size()) return false;
+    uint32_t bytes;
+    std::memcpy(&bytes, blob.data() + pos, 4);
+    pos += 4;
+    if (pos + bytes > blob.size()) return false;
+
+    const size_t count = bytes / sizeof(T);
+    const size_t old_size = append_mode ? dst.size() : 0;
+    dst.resize(old_size + count);
+    if (bytes > 0) {
+        std::memcpy(dst.data() + old_size, blob.data() + pos, bytes);
+    }
+    pos += bytes;
+    return true;
+}
+
+/// Serialize tokens [from_tok, to_tok) of a single layer's storage. from_tok
+/// and to_tok are clamped to the layer's token count to keep the format safe
+/// against under-populated layers.
+std::vector<uint8_t> serialize_layer_range(
+    const LayerKVStorage& layer, int num_heads, int head_dim,
+    int from_tok, int to_tok) {
+
+    if (from_tok < 0) from_tok = 0;
+    if (to_tok > layer.num_tokens) to_tok = layer.num_tokens;
+    if (to_tok < from_tok) to_tok = from_tok;
+
+    const size_t idx_stride = packed_index_words_per_token(num_heads, head_dim);
+    const size_t qjl_stride = qjl_sign_words_per_token(num_heads, head_dim);
+    const size_t norm_stride = norms_per_token(num_heads);
+    const size_t n = static_cast<size_t>(to_tok - from_tok);
+
+    const size_t idx_off = static_cast<size_t>(from_tok) * idx_stride;
+    const size_t qjl_off = static_cast<size_t>(from_tok) * qjl_stride;
+    const size_t norm_off = static_cast<size_t>(from_tok) * norm_stride;
+
+    std::vector<uint8_t> blob;
+    blob.reserve(24 + n * (2 * idx_stride + qjl_stride + 3 * norm_stride) * 4);
+
+    append_u32(blob, static_cast<uint32_t>(n));
+    append_span(blob, layer.packed_key_indices.data() + idx_off, n * idx_stride);
+    append_span(blob, layer.packed_value_indices.data() + idx_off, n * idx_stride);
+    append_span(blob, layer.key_norms.data() + norm_off, n * norm_stride);
+    append_span(blob, layer.value_norms.data() + norm_off, n * norm_stride);
+    append_span(blob, layer.key_qjl_signs.data() + qjl_off, n * qjl_stride);
+    append_span(blob, layer.key_qjl_norms.data() + norm_off, n * norm_stride);
+    return blob;
+}
+
+/// Load a per-layer blob into storage. On replace_mode=true the layer's
+/// existing arrays are discarded first; otherwise the decoded spans are
+/// appended to the current contents (used by apply_delta).
+bool load_layer_blob(const std::vector<uint8_t>& blob, LayerKVStorage& layer,
+                     bool replace_mode) {
+    size_t pos = 0;
+    if (pos + 4 > blob.size()) return false;
+    uint32_t n;
+    std::memcpy(&n, blob.data() + pos, 4);
+    pos += 4;
+
+    if (replace_mode) {
+        layer.packed_key_indices.clear();
+        layer.packed_value_indices.clear();
+        layer.key_norms.clear();
+        layer.value_norms.clear();
+        layer.key_qjl_signs.clear();
+        layer.key_qjl_norms.clear();
+        layer.num_tokens = 0;
+    }
+
+    const bool append_mode = !replace_mode;
+    if (!read_span(blob, pos, layer.packed_key_indices, append_mode)) return false;
+    if (!read_span(blob, pos, layer.packed_value_indices, append_mode)) return false;
+    if (!read_span(blob, pos, layer.key_norms, append_mode)) return false;
+    if (!read_span(blob, pos, layer.value_norms, append_mode)) return false;
+    if (!read_span(blob, pos, layer.key_qjl_signs, append_mode)) return false;
+    if (!read_span(blob, pos, layer.key_qjl_norms, append_mode)) return false;
+
+    layer.num_tokens += static_cast<int>(n);
+    return true;
+}
+
+} // namespace
+
+TQCacheSnapshot TQKVCache::snapshot() const {
+    TQCacheSnapshot snap;
+    snap.num_layers = static_cast<uint32_t>(config_.num_layers);
+    snap.num_positions = static_cast<uint32_t>(seq_length_);
+    snap.head_dim = static_cast<uint32_t>(config_.head_dim);
+    snap.num_heads = static_cast<uint32_t>(config_.num_heads);
+    snap.kv_bits = config_.k_bits;
+
+    snap.layer_data.reserve(layers_.size());
+    for (const auto& layer : layers_) {
+        snap.layer_data.push_back(
+            serialize_layer_range(layer, config_.num_heads, config_.head_dim,
+                                  0, layer.num_tokens));
+    }
+    return snap;
+}
+
+void TQKVCache::restore(const TQCacheSnapshot& snap) {
+    clear();
+
+    const size_t n_layers = std::min<size_t>(layers_.size(), snap.layer_data.size());
+    for (size_t i = 0; i < n_layers; ++i) {
+        load_layer_blob(snap.layer_data[i], layers_[i], /*replace_mode=*/true);
+    }
+
+    int max_tokens = 0;
+    for (const auto& l : layers_) {
+        if (l.num_tokens > max_tokens) max_tokens = l.num_tokens;
+    }
+    seq_length_ = max_tokens;
+}
+
+TQCacheDelta TQKVCache::delta(uint32_t from, uint32_t to) const {
+    TQCacheDelta d;
+    d.from_position = from;
+    d.to_position = to;
+    d.num_layers = static_cast<uint32_t>(config_.num_layers);
+    d.layer_data.reserve(layers_.size());
+
+    const int from_int = static_cast<int>(from);
+    const int to_int = static_cast<int>(to);
+    for (const auto& layer : layers_) {
+        d.layer_data.push_back(
+            serialize_layer_range(layer, config_.num_heads, config_.head_dim,
+                                  from_int, to_int));
+    }
+    return d;
+}
+
+void TQKVCache::apply_delta(const TQCacheDelta& d) {
+    const size_t n_layers = std::min<size_t>(layers_.size(), d.layer_data.size());
+    for (size_t i = 0; i < n_layers; ++i) {
+        load_layer_blob(d.layer_data[i], layers_[i], /*replace_mode=*/false);
+    }
+
+    int max_tokens = 0;
+    for (const auto& l : layers_) {
+        if (l.num_tokens > max_tokens) max_tokens = l.num_tokens;
+    }
+    seq_length_ = max_tokens;
+}
 
 } // namespace turboquant

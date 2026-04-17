@@ -2,6 +2,7 @@
 
 #include <mlx/mlx.h>
 #include "codebook.h"
+#include "cache_snapshot.h"
 #include <cstdint>
 #include <vector>
 
@@ -66,6 +67,24 @@ public:
     void clear();
 
     const KVCacheConfig& config() const;
+
+    /// Serialize the full cache state to a transferable snapshot. Safe to
+    /// call concurrently with append() if external locking is in place.
+    TQCacheSnapshot snapshot() const;
+
+    /// Replace the current cache state with the contents of a snapshot.
+    /// The cache is cleared first, so any in-flight reads must be drained
+    /// by the caller before invoking restore.
+    void restore(const TQCacheSnapshot& snap);
+
+    /// Extract positions [from, to) from every layer as an incremental delta.
+    /// Bounds are clamped to each layer's token count independently.
+    TQCacheDelta delta(uint32_t from, uint32_t to) const;
+
+    /// Append the contents of a delta to the current cache state. The delta
+    /// is assumed to pick up at the current seq_length; callers must sequence
+    /// deltas correctly.
+    void apply_delta(const TQCacheDelta& d);
 
 private:
     KVCacheConfig config_;
