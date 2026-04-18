@@ -10,6 +10,7 @@
 #include "turboquant/transport.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <future>
 #include <thread>
@@ -35,12 +36,13 @@ constexpr double kWorker2MemGb = 32.0;
 // subsequent disconnect tests have a node in the only state from which
 // Disconnected is reachable.
 void bring_node_active(NodeStateManager& mgr, NodeId id) {
-    bool ok = true;
-    ok &= mgr.transition(id, NodeStateCode::Evaluating);
-    ok &= mgr.transition(id, NodeStateCode::Loading);
-    ok &= mgr.transition(id, NodeStateCode::Ready);
-    ok &= mgr.transition(id, NodeStateCode::Active);
-    assert(ok);
+    // Separate assertions so a failing transition names its own line.
+    // With an aggregated boolean, a failure anywhere reports "ok was
+    // false" without saying which of the four transitions broke.
+    assert(mgr.transition(id, NodeStateCode::Evaluating));
+    assert(mgr.transition(id, NodeStateCode::Loading));
+    assert(mgr.transition(id, NodeStateCode::Ready));
+    assert(mgr.transition(id, NodeStateCode::Active));
 }
 
 // Run a single worker: connect to the coordinator, send one heartbeat with the
@@ -148,8 +150,14 @@ void test_three_node_join() {
     assert(hb_w2.rank == 2);
     assert(hb_w1.state == NodeStateCode::Active);
     assert(hb_w2.state == NodeStateCode::Active);
-    assert(hb_w1.available_memory_gb == static_cast<float>(kWorker1MemGb));
-    assert(hb_w2.available_memory_gb == static_cast<float>(kWorker2MemGb));
+    // Tolerance compare rather than `==` on float. It happens to hold
+    // exactly today (static_cast<float> of a literal round-trips through
+    // the wire intact), but a future change that quantizes or rescales
+    // the heartbeat field would surface as a flaky test rather than a
+    // bit-comparison failure.
+    constexpr float kMemoryTolGb = 1e-3f;
+    assert(std::fabs(hb_w1.available_memory_gb - static_cast<float>(kWorker1MemGb)) < kMemoryTolGb);
+    assert(std::fabs(hb_w2.available_memory_gb - static_cast<float>(kWorker2MemGb)) < kMemoryTolGb);
 
     // Build a three-node plan: coordinator (rank 0) plus both workers.
     std::vector<NodeMemoryInfo> cluster = {
@@ -204,9 +212,19 @@ void test_disconnect_triggers_redistribution() {
     bring_node_active(mgr, worker1_id);
     bring_node_active(mgr, worker2_id);
 
+    // Drain and verify both heartbeats. Same content check as the
+    // three-node-join test — confirms the disconnect scenario starts
+    // from the same known-good state rather than leaving the reads as
+    // "half-finished assertions" that drain bytes without inspecting.
     Heartbeat hb1, hb2;
     assert(ch1.recv_heartbeat(hb1));
     assert(ch2.recv_heartbeat(hb2));
+    const Heartbeat& hb_w1 = (hb1.rank == 1) ? hb1 : hb2;
+    const Heartbeat& hb_w2 = (hb1.rank == 1) ? hb2 : hb1;
+    assert(hb_w1.rank == 1);
+    assert(hb_w2.rank == 2);
+    assert(hb_w1.state == NodeStateCode::Active);
+    assert(hb_w2.state == NodeStateCode::Active);
 
     TQDistributedCoordinator coord;
     std::vector<NodeMemoryInfo> full_cluster = {
