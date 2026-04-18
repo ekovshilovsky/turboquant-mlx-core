@@ -56,6 +56,62 @@ Codebook build_from_centroids(const float* data, size_t count, uint8_t bits) {
     return Codebook{std::move(centroids), std::move(boundaries), bits};
 }
 
+// Minimum sample count to justify GPU dispatch for Lloyd-Max iteration.
+// Below this threshold the CPU binary search loop is faster than MLX kernel
+// launch overhead and GPU memory transfer latency.
+constexpr size_t kLloydMaxGpuThreshold = 65536;
+
+// Lloyd-Max iteration exits early when no centroid moves more than this
+// per step. Tighter thresholds rarely improve the fit meaningfully and
+// cost iterations; looser thresholds can stop short of the empirical
+// optimum.
+constexpr float kLloydMaxShiftThreshold = 1e-6f;
+
+// Assemble a full symmetric codebook from a fitted positive half.
+//
+// Finite samples from a near-symmetric distribution are never perfectly
+// symmetric, so fitting Lloyd-Max on the raw data produces centroids that
+// inherit the empirical asymmetry of the input. The downstream invariant
+// c[i] == -c[N-1-i] (enforced by validate_codebook and relied on by every
+// consumer of the codebook) therefore cannot be achieved by convergence
+// alone. Folding the input to |x| and fitting only the positive half, then
+// mirroring it, enforces symmetry exactly by construction.
+//
+// The mapping places the fitted positive centroids in the upper half and
+// their negated counterparts in the lower half, preserving strict sort
+// order across the full codebook. The center boundary between the smallest
+// positive and smallest negative centroid is exactly 0 by construction.
+Codebook assemble_symmetric_codebook(
+    const std::vector<float>& positive_centroids, uint8_t bits) {
+    const size_t half = positive_centroids.size();
+    const size_t num_centroids = half * 2;
+
+    std::vector<float> centroids(num_centroids);
+    for (size_t i = 0; i < half; ++i) {
+        centroids[half + i]     =  positive_centroids[i];
+        centroids[half - 1 - i] = -positive_centroids[i];
+    }
+
+    std::vector<float> boundaries(num_centroids - 1);
+    for (size_t i = 0; i + 1 < num_centroids; ++i) {
+        boundaries[i] = (centroids[i] + centroids[i + 1]) * 0.5f;
+    }
+
+    return Codebook{std::move(centroids), std::move(boundaries), bits};
+}
+
+// Extract the initialization for the positive-half Lloyd-Max fit from the
+// precomputed analytical codebook for N(0,1). The analytical codebook is
+// already symmetric, so its upper half is the correct starting point for
+// fitting a positive-only distribution.
+std::vector<float> initial_positive_centroids(uint8_t bits) {
+    Codebook analytical = generate_codebook(bits);
+    const size_t half = analytical.centroids.size() / 2;
+    return std::vector<float>(
+        analytical.centroids.begin() + static_cast<std::ptrdiff_t>(half),
+        analytical.centroids.end());
+}
+
 } // namespace
 
 Codebook generate_codebook(uint8_t bits) {
@@ -70,55 +126,63 @@ Codebook generate_codebook(uint8_t bits) {
     }
 }
 
-/// Minimum sample count to justify GPU dispatch for Lloyd-Max iteration.
-/// Below this threshold the CPU binary search loop is faster than MLX kernel
-/// launch overhead and GPU memory transfer latency.
-static constexpr size_t kLloydMaxGpuThreshold = 65536;
-
 /// CPU-only Lloyd-Max iteration for small datasets. Uses binary search over
 /// boundaries for bin assignment, which is efficient for datasets below the
 /// GPU dispatch threshold where kernel launch overhead would dominate.
-static Codebook generate_codebook_from_data_cpu(
+///
+/// The input is folded to |x| and only the positive half of the codebook is
+/// fit; the full codebook is assembled by mirroring. This guarantees exact
+/// symmetry (c[i] == -c[N-1-i]) without relying on convergence of an
+/// empirically-asymmetric distribution.
+///
+/// External linkage is retained (no `static`) so the CPU and GPU paths can
+/// be invoked directly from tests that verify both fits produce equivalent
+/// codebooks on identical input. The public entry point is still
+/// `generate_codebook_from_data`, which dispatches by sample count.
+Codebook generate_codebook_from_data_cpu(
     const std::vector<float>& data, uint8_t bits, int iterations) {
 
-    Codebook cb = generate_codebook(bits);
-    const size_t num_centroids = cb.centroids.size();
+    std::vector<float> positive = initial_positive_centroids(bits);
+    const size_t half = positive.size();
     const size_t n = data.size();
 
+    // Positive-half bin boundaries. The first bin covers [0, boundaries[0]),
+    // interior bins [boundaries[i-1], boundaries[i]), and the last bin
+    // [boundaries[half-2], +inf). This mirrors the layout used for the full
+    // codebook but operates on |x| so no negative-bin book-keeping is needed.
+    std::vector<float> pos_boundaries(half > 0 ? half - 1 : 0);
+
     for (int iter = 0; iter < iterations; ++iter) {
-        for (size_t i = 0; i + 1 < num_centroids; ++i) {
-            cb.boundaries[i] = (cb.centroids[i] + cb.centroids[i + 1]) * 0.5f;
+        for (size_t i = 0; i + 1 < half; ++i) {
+            pos_boundaries[i] = (positive[i] + positive[i + 1]) * 0.5f;
         }
 
-        std::vector<double> bin_sum(num_centroids, 0.0);
-        std::vector<size_t> bin_count(num_centroids, 0);
+        std::vector<double> bin_sum(half, 0.0);
+        std::vector<size_t> bin_count(half, 0);
 
         for (size_t i = 0; i < n; ++i) {
-            auto it = std::lower_bound(cb.boundaries.begin(), cb.boundaries.end(), data[i]);
-            size_t idx = static_cast<size_t>(it - cb.boundaries.begin());
-            if (idx >= num_centroids) idx = num_centroids - 1;
-            bin_sum[idx] += static_cast<double>(data[i]);
+            float abs_v = std::abs(data[i]);
+            auto it = std::lower_bound(pos_boundaries.begin(), pos_boundaries.end(), abs_v);
+            size_t idx = static_cast<size_t>(it - pos_boundaries.begin());
+            if (idx >= half) idx = half - 1;
+            bin_sum[idx] += static_cast<double>(abs_v);
             bin_count[idx]++;
         }
 
         float max_shift = 0.0f;
-        for (size_t i = 0; i < num_centroids; ++i) {
+        for (size_t i = 0; i < half; ++i) {
             if (bin_count[i] > 0) {
                 float new_centroid = static_cast<float>(bin_sum[i] / static_cast<double>(bin_count[i]));
-                float shift = std::abs(new_centroid - cb.centroids[i]);
+                float shift = std::abs(new_centroid - positive[i]);
                 if (shift > max_shift) max_shift = shift;
-                cb.centroids[i] = new_centroid;
+                positive[i] = new_centroid;
             }
         }
 
-        if (max_shift < 1e-6f) break;
+        if (max_shift < kLloydMaxShiftThreshold) break;
     }
 
-    for (size_t i = 0; i + 1 < num_centroids; ++i) {
-        cb.boundaries[i] = (cb.centroids[i] + cb.centroids[i + 1]) * 0.5f;
-    }
-
-    return cb;
+    return assemble_symmetric_codebook(positive, bits);
 }
 
 /// GPU-accelerated Lloyd-Max iteration using MLX array operations.
@@ -126,75 +190,99 @@ static Codebook generate_codebook_from_data_cpu(
 /// sum and count operations run on GPU through MLX's lazy evaluation,
 /// avoiding the serial binary search loop over every element.
 ///
-/// Each iteration constructs per-bin masks using boundary comparisons,
-/// computes masked sums and counts via GPU reductions, and updates
-/// centroids on the CPU. The boundary comparisons and reductions are
-/// the dominant cost and parallelize well on the GPU ALUs.
-static Codebook generate_codebook_from_data_gpu(
+/// The input is folded to |x| on the GPU and the fit is performed on the
+/// positive half of the codebook only. The full codebook is assembled by
+/// mirroring the fitted positive centroids. This enforces the symmetry
+/// invariant c[i] == -c[N-1-i] exactly by construction rather than hoping
+/// that convergence over an empirically-asymmetric finite sample happens
+/// to produce it.
+///
+/// Each iteration constructs per-bin masks over |x| using boundary
+/// comparisons, computes masked sums and counts via GPU reductions, and
+/// updates positive centroids on the host. The boundary comparisons and
+/// reductions are the dominant cost and parallelize well on the GPU ALUs.
+///
+/// External linkage is retained (no `static`) so the CPU and GPU paths can
+/// be invoked directly from tests that verify both fits produce equivalent
+/// codebooks on identical input. The public entry point is still
+/// `generate_codebook_from_data`, which dispatches by sample count.
+Codebook generate_codebook_from_data_gpu(
     const std::vector<float>& data, uint8_t bits, int iterations) {
 
-    Codebook cb = generate_codebook(bits);
-    const int num_centroids = static_cast<int>(cb.centroids.size());
+    std::vector<float> positive = initial_positive_centroids(bits);
+    const int half = static_cast<int>(positive.size());
 
-    // Transfer the data to GPU once; reused across all iterations
+    // Transfer the data to GPU once and fold to |x|; the folded array is
+    // reused across all iterations so the reduction operates on the half
+    // of the distribution the positive centroids actually represent.
     auto data_arr = mlx::core::array(
         data.data(),
         {static_cast<int>(data.size())},
         mlx::core::float32);
+    auto abs_data = mlx::core::abs(data_arr);
+
+    std::vector<float> pos_boundaries(half > 0 ? half - 1 : 0);
 
     for (int iter = 0; iter < iterations; ++iter) {
-        // Recompute boundaries as midpoints between adjacent centroids
-        for (int i = 0; i + 1 < num_centroids; ++i) {
-            cb.boundaries[i] = (cb.centroids[i] + cb.centroids[i + 1]) * 0.5f;
+        // Recompute positive-half boundaries as midpoints between adjacent
+        // positive centroids. Bin 0 covers [0, boundaries[0]), interior bins
+        // cover [boundaries[i-1], boundaries[i]), and the last bin covers
+        // [boundaries[half-2], +inf).
+        for (int i = 0; i + 1 < half; ++i) {
+            pos_boundaries[i] = (positive[i] + positive[i + 1]) * 0.5f;
         }
 
         // Build boundary array on GPU for vectorized bin assignment.
-        // For typical bit widths (2-5 bits = 4-32 centroids), the boundary
-        // array is tiny and the overhead is negligible compared to the
-        // reduction over millions of data elements.
+        // For typical bit widths (2-5 bits = 2-16 positive centroids), the
+        // boundary array is tiny and the overhead is negligible compared to
+        // the reduction over millions of data elements.
         auto boundaries_arr = mlx::core::array(
-            cb.boundaries.data(),
-            {static_cast<int>(cb.boundaries.size())},
+            pos_boundaries.data(),
+            {static_cast<int>(pos_boundaries.size())},
             mlx::core::float32);
 
         // Compute per-bin masked sums and counts using GPU reductions.
         // Each bin is defined by its lower and upper boundaries. The
         // comparison chain produces a boolean mask per bin, which is
-        // multiplied element-wise with the data to produce masked values
-        // for summation. This replaces the CPU's per-element binary search
-        // with N parallel GPU comparisons (N = number of bins).
+        // multiplied element-wise with |x| to produce masked values for
+        // summation. This replaces a per-element binary search with
+        // N/2 parallel GPU comparisons.
+        //
+        // MLX reductions run in float32 with implementation-defined summation
+        // order (typically a tree reduction). The CPU path uses double-precision
+        // accumulation for stability. Expect ~1-ULP drift between the two paths
+        // at the centroid level — still well under float16 storage precision.
         std::vector<mlx::core::array> bin_sums;
         std::vector<mlx::core::array> bin_counts;
-        bin_sums.reserve(num_centroids);
-        bin_counts.reserve(num_centroids);
+        bin_sums.reserve(static_cast<size_t>(half));
+        bin_counts.reserve(static_cast<size_t>(half));
 
-        for (int bin = 0; bin < num_centroids; ++bin) {
-            // Extract scalar boundary values for this bin's range using take()
-            // on the boundary array. Each bin is defined by [lo_boundary, hi_boundary).
+        for (int bin = 0; bin < half; ++bin) {
             mlx::core::array mask(0.0f);
-            if (bin == 0 && bin == num_centroids - 1) {
-                // Single-bin edge case: all elements belong to this bin
+            if (bin == 0 && bin == half - 1) {
+                // Single-bin edge case (1-bit codebook): all elements belong
+                // to the sole positive bin.
                 mask = mlx::core::astype(
-                    mlx::core::ones_like(data_arr), mlx::core::bool_);
+                    mlx::core::ones_like(abs_data), mlx::core::bool_);
             } else if (bin == 0) {
-                // First bin: all elements below the first boundary
+                // First positive bin: |x| below the first positive boundary
                 auto hi = mlx::core::take(boundaries_arr, 0);
-                mask = mlx::core::less(data_arr, hi);
-            } else if (bin == num_centroids - 1) {
-                // Last bin: all elements at or above the last boundary
+                mask = mlx::core::less(abs_data, hi);
+            } else if (bin == half - 1) {
+                // Last positive bin: |x| at or above the last positive boundary
                 auto lo = mlx::core::take(boundaries_arr, bin - 1);
-                mask = mlx::core::greater_equal(data_arr, lo);
+                mask = mlx::core::greater_equal(abs_data, lo);
             } else {
-                // Interior bin: elements in [boundaries[bin-1], boundaries[bin])
+                // Interior positive bin: |x| in [boundaries[bin-1], boundaries[bin])
                 auto lo = mlx::core::take(boundaries_arr, bin - 1);
                 auto hi = mlx::core::take(boundaries_arr, bin);
-                auto ge = mlx::core::greater_equal(data_arr, lo);
-                auto lt = mlx::core::less(data_arr, hi);
+                auto ge = mlx::core::greater_equal(abs_data, lo);
+                auto lt = mlx::core::less(abs_data, hi);
                 mask = mlx::core::logical_and(ge, lt);
             }
 
             auto mask_f = mlx::core::astype(mask, mlx::core::float32);
-            auto masked_data = mlx::core::multiply(data_arr, mask_f);
+            auto masked_data = mlx::core::multiply(abs_data, mask_f);
             bin_sums.push_back(mlx::core::sum(masked_data));
             bin_counts.push_back(mlx::core::sum(mask_f));
         }
@@ -202,38 +290,33 @@ static Codebook generate_codebook_from_data_gpu(
         // Materialize all bin reductions in a single GPU dispatch to maximize
         // occupancy and minimize synchronization points
         std::vector<mlx::core::array> to_materialize;
-        to_materialize.reserve(num_centroids * 2);
-        for (int bin = 0; bin < num_centroids; ++bin) {
+        to_materialize.reserve(static_cast<size_t>(half) * 2);
+        for (int bin = 0; bin < half; ++bin) {
             to_materialize.push_back(bin_sums[bin]);
             to_materialize.push_back(bin_counts[bin]);
         }
         mlx::core::eval(to_materialize);
 
-        // Update centroids on CPU from the GPU-computed sums and counts.
+        // Update positive centroids from the GPU-computed sums and counts.
         // Empty bins retain their previous centroid to maintain coverage.
         float max_shift = 0.0f;
-        for (int bin = 0; bin < num_centroids; ++bin) {
+        for (int bin = 0; bin < half; ++bin) {
             float count = bin_counts[bin].item<float>();
             if (count > 0.0f) {
                 float new_centroid = bin_sums[bin].item<float>() / count;
-                float shift = std::abs(new_centroid - cb.centroids[bin]);
+                float shift = std::abs(new_centroid - positive[bin]);
                 if (shift > max_shift) max_shift = shift;
-                cb.centroids[bin] = new_centroid;
+                positive[bin] = new_centroid;
             }
         }
 
         // Terminate early when all centroids have stabilized. WHT-rotated
         // weight distributions are near-Gaussian, so convergence from the
         // N(0,1) initial guess typically completes in 20-30 iterations.
-        if (max_shift < 1e-6f) break;
+        if (max_shift < kLloydMaxShiftThreshold) break;
     }
 
-    // Recompute final boundaries from the converged centroids
-    for (int i = 0; i + 1 < num_centroids; ++i) {
-        cb.boundaries[i] = (cb.centroids[i] + cb.centroids[i + 1]) * 0.5f;
-    }
-
-    return cb;
+    return assemble_symmetric_codebook(positive, bits);
 }
 
 Codebook generate_codebook_from_data(const std::vector<float>& data, uint8_t bits, int iterations) {
@@ -308,9 +391,13 @@ bool validate_codebook(const Codebook& codebook) {
         if (std::abs(b[i] - expected_mid) > 1e-5f) return false;
     }
 
-    // Symmetry: centroid[i] == -centroid[N-1-i] for N(0,1)-derived codebooks
+    // Symmetry: centroid[i] == -centroid[N-1-i]. Both the analytical codebook
+    // and the data-fitted codebook build their negative half by negating the
+    // positive half, so this relation holds exactly at the bit level and
+    // tolerance is neither required nor desirable here — any non-zero
+    // deviation indicates a construction bug.
     for (size_t i = 0; i < c.size() / 2; i++) {
-        if (std::abs(c[i] + c[c.size() - 1 - i]) > 1e-4f) return false;
+        if (c[i] + c[c.size() - 1 - i] != 0.0f) return false;
     }
 
     return true;
