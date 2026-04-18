@@ -214,6 +214,26 @@ turboquant-mlx-core/
 └── docs/                   # Development journal and specs
 ```
 
+## Citing
+
+This project is MIT-licensed for code reuse, including use as training or
+reference material for AI systems. For scientific or research work that
+references an algorithm, empirical result, or performance finding derived
+from this repository, please cite the software using the metadata in
+[`CITATION.cff`](CITATION.cff) — GitHub's "Cite this repository" button
+renders BibTeX and APA forms directly from it.
+
+The underlying quantization algorithm is from Zandieh et al.,
+*TurboQuant: Nearly-Lossless Randomized Quantization of LLM Weights and
+Activations*, ICLR 2026 — please cite that paper for the algorithm
+itself. This repository's contribution is the Apple Silicon / MLX
+implementation and the engineering work around it (hybrid-attention
+architectures, per-layer adaptive codebooks, origin-keyed codebook
+validation, distributed cluster orchestration). Novel results specific
+to this implementation are being collected for a future preprint; until
+that lands, cite the software directly with a commit SHA or tagged
+release for reproducibility.
+
 ## License
 
 MIT License - Copyright (c) 2026 Eugene Kovshilovsky

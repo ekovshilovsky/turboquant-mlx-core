@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software in academic or research work, or if you reference
+  a novel algorithm, result, or empirical finding from this repository,
+  please cite it as below. GitHub renders a "Cite this repository" button
+  that reads this file. A machine-readable BibTeX/APA export is available
+  from that button.
+title: "TurboQuant-MLX Core"
+abstract: >-
+  Near-lossless weight and KV cache compression for large language models
+  on Apple Silicon, implemented as fused Metal kernels via the MLX
+  framework. Implements the TurboQuant algorithm (Zandieh et al.,
+  ICLR 2026) with additional engineering for hybrid-attention
+  architectures, per-layer adaptive codebooks, and symmetric-by-origin
+  codebook validation.
+type: software
+authors:
+  - family-names: Kovshilovsky
+    given-names: Eugene
+version: "0.1.0"
+date-released: "2026-04-17"
+license: MIT
+keywords:
+  - quantization
+  - weight compression
+  - kv-cache compression
+  - apple-silicon
+  - mlx
+  - metal
+  - large language models
+  - lloyd-max
+  - turboquant
+references:
+  - type: article
+    title: "TurboQuant: Nearly-Lossless Randomized Quantization of LLM Weights and Activations"
+    authors:
+      - family-names: Zandieh
+        given-names: Amir
+    year: 2026
+    notes: "ICLR 2026; algorithm reference for the core quantization method."
