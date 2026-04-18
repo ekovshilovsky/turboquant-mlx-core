@@ -6,6 +6,17 @@
 
 namespace turboquant {
 
+/// Where a codebook's centroids came from, which controls whether
+/// strict symmetry (c[i] == -c[N-1-i]) is a required invariant.
+/// Analytical codebooks are the precomputed optimum for N(0,1) and
+/// are symmetric by construction. Empirical codebooks fit to real
+/// data may legitimately capture distributional skew and need not
+/// be symmetric.
+enum class CodebookOrigin : uint8_t {
+    Analytical,
+    Empirical,
+};
+
 /// Lloyd-Max optimal centroids for quantizing coordinates after
 /// Walsh-Hadamard rotation of normalized weight vectors.
 /// Centroids are precomputed for the Beta distribution that arises
@@ -14,6 +25,7 @@ struct Codebook {
     std::vector<float> centroids;   ///< Sorted centroid values (2^bits entries)
     std::vector<float> boundaries;  ///< Decision boundaries between centroids
     uint8_t bits;                   ///< Quantization bit width (1-5)
+    CodebookOrigin origin = CodebookOrigin::Analytical;
 };
 
 /// Generate Lloyd-Max codebook for the specified bit width.

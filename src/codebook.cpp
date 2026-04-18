@@ -115,15 +115,18 @@ std::vector<float> initial_positive_centroids(uint8_t bits) {
 } // namespace
 
 Codebook generate_codebook(uint8_t bits) {
+    Codebook cb;
     switch (bits) {
-        case 1: return build_from_centroids(kCentroids1Bit, 2,  bits);
-        case 2: return build_from_centroids(kCentroids2Bit, 4,  bits);
-        case 3: return build_from_centroids(kCentroids3Bit, 8,  bits);
-        case 4: return build_from_centroids(kCentroids4Bit, 16, bits);
-        case 5: return build_from_centroids(kCentroids5Bit, 32, bits);
+        case 1: cb = build_from_centroids(kCentroids1Bit, 2,  bits); break;
+        case 2: cb = build_from_centroids(kCentroids2Bit, 4,  bits); break;
+        case 3: cb = build_from_centroids(kCentroids3Bit, 8,  bits); break;
+        case 4: cb = build_from_centroids(kCentroids4Bit, 16, bits); break;
+        case 5: cb = build_from_centroids(kCentroids5Bit, 32, bits); break;
         default:
             throw std::invalid_argument("Unsupported bit width; must be 1-5");
     }
+    cb.origin = CodebookOrigin::Analytical;
+    return cb;
 }
 
 /// CPU-only Lloyd-Max iteration for small datasets. Uses binary search over
@@ -182,7 +185,9 @@ Codebook generate_codebook_from_data_cpu(
         if (max_shift < kLloydMaxShiftThreshold) break;
     }
 
-    return assemble_symmetric_codebook(positive, bits);
+    Codebook cb = assemble_symmetric_codebook(positive, bits);
+    cb.origin = CodebookOrigin::Empirical;
+    return cb;
 }
 
 /// GPU-accelerated Lloyd-Max iteration using MLX array operations.
@@ -316,7 +321,9 @@ Codebook generate_codebook_from_data_gpu(
         if (max_shift < kLloydMaxShiftThreshold) break;
     }
 
-    return assemble_symmetric_codebook(positive, bits);
+    Codebook cb = assemble_symmetric_codebook(positive, bits);
+    cb.origin = CodebookOrigin::Empirical;
+    return cb;
 }
 
 Codebook generate_codebook_from_data(const std::vector<float>& data, uint8_t bits, int iterations) {
@@ -391,13 +398,21 @@ bool validate_codebook(const Codebook& codebook) {
         if (std::abs(b[i] - expected_mid) > 1e-5f) return false;
     }
 
-    // Symmetry: centroid[i] == -centroid[N-1-i]. Both the analytical codebook
-    // and the data-fitted codebook build their negative half by negating the
-    // positive half, so this relation holds exactly at the bit level and
-    // tolerance is neither required nor desirable here — any non-zero
-    // deviation indicates a construction bug.
-    for (size_t i = 0; i < c.size() / 2; i++) {
-        if (c[i] + c[c.size() - 1 - i] != 0.0f) return false;
+    if (codebook.origin == CodebookOrigin::Analytical) {
+        // Strict symmetry: analytical codebooks model a symmetric
+        // distribution (N(0,1)) and are constructed symmetric. Exact
+        // bit-level equality is achievable and enforced.
+        for (size_t i = 0; i < c.size() / 2; i++) {
+            if (c[i] + c[c.size() - 1 - i] != 0.0f) return false;
+        }
+    } else {
+        // Empirical codebooks are currently produced by a symmetric
+        // fold-and-mirror fit, so they are also strictly symmetric —
+        // this branch will relax when fold-and-mirror is dropped in
+        // the following commit.
+        for (size_t i = 0; i < c.size() / 2; i++) {
+            if (c[i] + c[c.size() - 1 - i] != 0.0f) return false;
+        }
     }
 
     return true;
