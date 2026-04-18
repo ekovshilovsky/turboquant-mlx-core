@@ -65,13 +65,29 @@ option(TQ_BUILD_TESTS "Build tests" ON)
 if(TQ_BUILD_TESTS)
   enable_testing()
 
+  # Test binaries must keep assert() active regardless of CMAKE_BUILD_TYPE.
+  # Release builds default to -DNDEBUG, which turns every assert() into a
+  # no-op — silently neutralizing every assertion in every test file.
+  # -UNDEBUG on the test targets undefines the macro at the compiler
+  # command line so assertions run. The production library target keeps
+  # -DNDEBUG for optimization; only test binaries are affected here.
+
+  # Tests use relative paths to tests/fixtures/ — run them from the
+  # project source directory so `tests/fixtures/*` resolves identically
+  # whether the test is invoked directly or via ctest. Without this,
+  # ctest runs tests from CMAKE_CURRENT_BINARY_DIR and relative fixture
+  # paths silently miss (then NDEBUG would previously have stripped the
+  # null-check asserts that should have caught it).
+
   # Unit tests — each file has its own main(), build separately
   file(GLOB TQ_UNIT_TEST_SOURCES tests/unit/*.cpp)
   foreach(TEST_SOURCE ${TQ_UNIT_TEST_SOURCES})
     get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
     add_executable(tq_${TEST_NAME} ${TEST_SOURCE})
     target_link_libraries(tq_${TEST_NAME} PRIVATE turboquant_mlx)
-    add_test(NAME unit_${TEST_NAME} COMMAND tq_${TEST_NAME})
+    target_compile_options(tq_${TEST_NAME} PRIVATE -UNDEBUG)
+    add_test(NAME unit_${TEST_NAME} COMMAND tq_${TEST_NAME}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
 
   # Integration tests — each file has its own main(), build separately
@@ -80,7 +96,9 @@ if(TQ_BUILD_TESTS)
     get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
     add_executable(tq_${TEST_NAME} ${TEST_SOURCE})
     target_link_libraries(tq_${TEST_NAME} PRIVATE turboquant_mlx)
-    add_test(NAME integration_${TEST_NAME} COMMAND tq_${TEST_NAME})
+    target_compile_options(tq_${TEST_NAME} PRIVATE -UNDEBUG)
+    add_test(NAME integration_${TEST_NAME} COMMAND tq_${TEST_NAME}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
 
   # C API tests (compiled as C, not C++) — each file has its own main()
@@ -89,8 +107,10 @@ if(TQ_BUILD_TESTS)
     get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
     add_executable(tq_${TEST_NAME} ${TEST_SOURCE})
     target_link_libraries(tq_${TEST_NAME} PRIVATE turboquant_mlx)
+    target_compile_options(tq_${TEST_NAME} PRIVATE -UNDEBUG)
     set_target_properties(tq_${TEST_NAME} PROPERTIES LINKER_LANGUAGE C)
-    add_test(NAME c_api_${TEST_NAME} COMMAND tq_${TEST_NAME})
+    add_test(NAME c_api_${TEST_NAME} COMMAND tq_${TEST_NAME}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
 endif()
 
