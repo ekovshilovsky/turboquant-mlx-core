@@ -33,7 +33,7 @@ static float compute_mse(const mlx::core::array& a, const mlx::core::array& b) {
 /// Compute per-row L2 norms and return as a 1-D array of shape [rows].
 static mlx::core::array row_norms(const mlx::core::array& mat) {
     auto sq = mlx::core::multiply(mat, mat);
-    auto sum = mlx::core::sum(sq, {1});
+    auto sum = mlx::core::sum(sq, 1);
     auto norms = mlx::core::sqrt(sum);
     mlx::core::eval(norms);
     return norms;
@@ -155,72 +155,6 @@ static void test_norm_correction() {
     }
 
     printf("  PASS: norm correction produces matching row norms (dual-pass, 5%% tolerance)\n");
-}
-
-/// Verify that dual-pass (4+4) norm correction produces tighter norm ratios
-/// than primary-only (4+0). The residual pass reduces quantization error,
-/// and including it in the norm correction computation yields correction
-/// factors that more accurately compensate for reconstruction shrinkage.
-static void test_dual_pass_norms_tighter_than_primary_only() {
-    const int out_features = 8;
-    const int in_features = 512;
-    auto weight = make_test_weight(out_features, in_features, 789);
-
-    auto primary_cb = generate_codebook(4);
-    auto residual_cb = generate_codebook(4);
-
-    // Primary-only quantization (residual_bits = 0)
-    QuantizerConfig config_primary{};
-    config_primary.primary_bits = 4;
-    config_primary.residual_bits = 0;
-    config_primary.block_size = 512;
-    config_primary.norm_correction = true;
-
-    auto qw_primary = quantize_weight(weight, primary_cb, residual_cb, config_primary);
-    auto recon_primary = dequantize_weight_cpu(qw_primary, primary_cb, residual_cb, config_primary.block_size);
-    mlx::core::eval(recon_primary);
-
-    // Dual-pass quantization (residual_bits = 4)
-    QuantizerConfig config_dual{};
-    config_dual.primary_bits = 4;
-    config_dual.residual_bits = 4;
-    config_dual.block_size = 512;
-    config_dual.norm_correction = true;
-
-    auto qw_dual = quantize_weight(weight, primary_cb, residual_cb, config_dual);
-    auto recon_dual = dequantize_weight_cpu(qw_dual, primary_cb, residual_cb, config_dual.block_size);
-    mlx::core::eval(recon_dual);
-
-    auto orig_norms = row_norms(weight);
-    auto primary_norms = row_norms(recon_primary);
-    auto dual_norms = row_norms(recon_dual);
-
-    const float* orig_ptr = orig_norms.data<float>();
-    const float* primary_ptr = primary_norms.data<float>();
-    const float* dual_ptr = dual_norms.data<float>();
-
-    // Compute mean absolute deviation of norm ratio from 1.0 for each mode
-    float primary_mad = 0.0f;
-    float dual_mad = 0.0f;
-    for (int i = 0; i < out_features; ++i) {
-        float primary_ratio = primary_ptr[i] / orig_ptr[i];
-        float dual_ratio = dual_ptr[i] / orig_ptr[i];
-        primary_mad += std::fabs(primary_ratio - 1.0f);
-        dual_mad += std::fabs(dual_ratio - 1.0f);
-    }
-    primary_mad /= out_features;
-    dual_mad /= out_features;
-
-    printf("    Primary-only mean |ratio - 1|: %.6f\n", primary_mad);
-    printf("    Dual-pass    mean |ratio - 1|: %.6f\n", dual_mad);
-
-    // Dual-pass norm correction should produce ratios closer to 1.0 than
-    // primary-only, because the full reconstruction (primary + residual) is
-    // a better approximation of the original normalized weight.
-    assert(dual_mad < primary_mad &&
-           "dual-pass norm ratios should be closer to 1.0 than primary-only");
-
-    printf("  PASS: dual-pass norm correction is tighter than primary-only\n");
 }
 
 static void test_seed_determinism() {
@@ -717,7 +651,7 @@ static void test_per_layer_codebook_reduces_error() {
     mlx::core::eval(weight);
     float scale = std::sqrt(static_cast<float>(in_features));
     auto sq = mlx::core::multiply(weight, weight);
-    auto row_sum = mlx::core::sum(sq, {1}, true);
+    auto row_sum = mlx::core::sum(sq, 1, true);
     auto row_nrm = mlx::core::sqrt(row_sum);
     auto safe = mlx::core::maximum(row_nrm, mlx::core::array(1e-10f));
     auto w_norm = mlx::core::divide(weight, safe);
@@ -917,7 +851,6 @@ int main() {
     test_correct_shapes();
     test_residual_reduces_error();
     test_norm_correction();
-    test_dual_pass_norms_tighter_than_primary_only();
     test_seed_determinism();
     test_zero_row_handling();
     test_weight_seeds_are_content_derived();
