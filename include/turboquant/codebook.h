@@ -32,18 +32,13 @@ struct Codebook {
 /// Returns precomputed centroids optimal for the Beta distribution.
 Codebook generate_codebook(uint8_t bits);
 
-/// Generate a Lloyd-Max codebook refined on actual data values.
-/// Starts from the precomputed N(0,1) centroids and iteratively adjusts
-/// them to minimize mean squared quantization error for the empirical
-/// distribution of the provided samples. Converges in 50-100 iterations
-/// for typical weight distributions.
-///
-/// The fit is performed on |data| against the positive half of the
-/// codebook, and the full codebook is assembled by mirroring. This
-/// guarantees exact bit-level symmetry (c[i] == -c[N-1-i]) regardless
-/// of finite-sample asymmetry in the input, at the cost of modeling the
-/// distribution as symmetric around zero — appropriate for WHT-rotated
-/// weights and other near-Gaussian inputs this library targets.
+/// Fit a data-adaptive codebook via Lloyd-Max iteration on the supplied
+/// samples. The resulting codebook is marked Empirical and is not
+/// required to be symmetric around zero — real per-layer weight
+/// distributions (e.g., post-WHT residual skew) often aren't, and
+/// forcing symmetry would discard exactly the information per-layer
+/// fitting is meant to capture. For the analytical symmetric N(0,1)
+/// optimum, use generate_codebook(bits) instead.
 Codebook generate_codebook_from_data(const std::vector<float>& data, uint8_t bits, int iterations = 100);
 
 /// Map continuous values to nearest centroid indices.

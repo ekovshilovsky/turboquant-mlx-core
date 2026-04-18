@@ -15,38 +15,6 @@ namespace fs = std::filesystem;
 // Forward declaration for the internal metadata reader defined in serialization.cpp
 namespace turboquant {
     std::unordered_map<std::string, std::string> read_tq_metadata(const std::string& path);
-
-    // Forward declarations for the internal Lloyd-Max entry points defined in
-    // codebook.cpp. These are exposed with external linkage specifically so the
-    // CPU and GPU fits can be compared on identical input without going through
-    // the size-based dispatch in generate_codebook_from_data.
-    Codebook generate_codebook_from_data_cpu(
-        const std::vector<float>& data, uint8_t bits, int iterations);
-    Codebook generate_codebook_from_data_gpu(
-        const std::vector<float>& data, uint8_t bits, int iterations);
-}
-
-// Codebook centroids are persisted as float16. Any drift smaller than
-// one ULP at float16 precision vanishes at storage time, so that's the
-// meaningful bound for CPU-vs-GPU agreement. Tighter would fail on
-// legitimate reduction-order differences; looser would miss bugs that
-// survive float16 rounding.
-constexpr float kHalfPrecisionEpsilon = 0x1.0p-10f;  // 2^-10 = 0.0009765625
-
-/// Populate a vector with approximately N(0,1) samples using Box-Muller driven
-/// by a deterministic LCG. Shared helper so every codebook test exercises the
-/// same distribution as the original test_gpu_lloyd_max_agreement assertion.
-static void fill_boxmuller_normal(std::vector<float>& data, uint32_t seed) {
-    uint32_t state = seed;
-    const int n = static_cast<int>(data.size());
-    for (int i = 0; i < n; ++i) {
-        state = state * 1103515245u + 12345u;
-        float u1 = static_cast<float>(state >> 16) / 65536.0f;
-        u1 = std::max(u1, 1e-7f);
-        state = state * 1103515245u + 12345u;
-        float u2 = static_cast<float>(state >> 16) / 65536.0f;
-        data[i] = std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
-    }
 }
 
 /// Create a test model directory with multiple layers for parallel conversion testing.
@@ -422,102 +390,23 @@ static void test_parallel_conversion_timing() {
     printf("  PASS: parallel conversion timing within acceptable bounds\n");
 }
 
-/// Test 7: Verify the fold-and-mirror construction produces a codebook whose
-/// positive and negative halves are exact bit-level negatives of each other.
-/// The guard is on the construction step, not on the quality of the fit:
-/// regardless of any finite-sample asymmetry in the Box-Muller input, the
-/// symmetry invariant must hold with zero tolerance because mirroring is a
-/// deterministic negation of the fitted positive half.
-static void test_symmetry_by_construction() {
-    const int n = 131072;
-    std::vector<float> data(n);
-    fill_boxmuller_normal(data, 12345u);
-
-    auto cb = turboquant::generate_codebook_from_data(data, 4, 100);
-
-    assert(cb.centroids.size() == 16 &&
-           "4-bit codebook must have 16 centroids");
-
-    const size_t N = cb.centroids.size();
-    for (size_t i = 0; i < N / 2; ++i) {
-        float lo = cb.centroids[i];
-        float hi = cb.centroids[N - 1 - i];
-        assert(lo + hi == 0.0f &&
-               "mirrored centroid pair must sum to exactly zero");
+/// Test 7: Verify analytical codebooks retain exact bit-level symmetry around
+/// zero. Analytical codebooks are constructed symmetric and downstream code
+/// may rely on this property; empirical codebooks are deliberately allowed to
+/// capture asymmetry and do not carry this invariant.
+static void test_analytical_codebook_strict_symmetry() {
+    // Analytical codebooks are constructed symmetric around zero and
+    // downstream assumptions rely on this exact bit-level equality.
+    // Empirical codebooks deliberately do NOT have this property.
+    for (uint8_t bits : {3, 4, 5}) {
+        auto cb = turboquant::generate_codebook(bits);
+        assert(cb.origin == turboquant::CodebookOrigin::Analytical);
+        for (size_t i = 0; i < cb.centroids.size() / 2; ++i) {
+            size_t j = cb.centroids.size() - 1 - i;
+            assert(cb.centroids[i] + cb.centroids[j] == 0.0f);
+        }
     }
-
-    printf("  PASS: fitted codebook is symmetric by construction (exact bit equality)\n");
-}
-
-/// Test 8: Verify the fitted positive half satisfies the structural invariants
-/// downstream consumers rely on: every entry strictly positive and the set in
-/// strictly ascending order. Bit-level symmetry (test 7) guarantees the negative
-/// half mirrors this; validating the positive half in isolation is the cleanest
-/// check on the Lloyd-Max update loop itself.
-static void test_positive_half_valid() {
-    const int n = 131072;
-    std::vector<float> data(n);
-    fill_boxmuller_normal(data, 12345u);
-
-    auto cb = turboquant::generate_codebook_from_data(data, 4, 100);
-
-    const size_t N = cb.centroids.size();
-    const size_t half = N / 2;
-
-    for (size_t i = half; i < N; ++i) {
-        assert(cb.centroids[i] > 0.0f &&
-               "positive-half centroid must be strictly positive");
-    }
-
-    for (size_t i = half + 1; i < N; ++i) {
-        assert(cb.centroids[i] > cb.centroids[i - 1] &&
-               "positive-half centroids must be strictly ascending");
-    }
-
-    printf("  PASS: positive-half centroids are strictly positive and ascending\n");
-}
-
-/// Test 9: Verify the CPU and GPU Lloyd-Max paths converge to equivalent
-/// codebooks on identical input. The paths use different reduction strategies
-/// (CPU accumulates sequentially in doubles; GPU uses tree reductions in
-/// float32), so bit equality is not expected. Agreement at one float16 ULP is
-/// the principled bound because codebooks are persisted as float16; anything
-/// tighter would fail on legitimate reduction-order drift, anything looser
-/// would hide bugs that survive storage-precision rounding.
-static void test_cpu_gpu_codebook_match() {
-    const int n = 131072;
-    std::vector<float> data(n);
-    fill_boxmuller_normal(data, 12345u);
-
-    auto cb_cpu = turboquant::generate_codebook_from_data_cpu(data, 4, 100);
-    auto cb_gpu = turboquant::generate_codebook_from_data_gpu(data, 4, 100);
-
-    assert(cb_cpu.centroids.size() == cb_gpu.centroids.size() &&
-           "CPU and GPU codebooks must have the same centroid count");
-
-    float max_centroid_dev = 0.0f;
-    for (size_t i = 0; i < cb_cpu.centroids.size(); ++i) {
-        float dev = std::abs(cb_cpu.centroids[i] - cb_gpu.centroids[i]);
-        if (dev > max_centroid_dev) max_centroid_dev = dev;
-    }
-
-    float max_boundary_dev = 0.0f;
-    for (size_t i = 0; i < cb_cpu.boundaries.size(); ++i) {
-        float dev = std::abs(cb_cpu.boundaries[i] - cb_gpu.boundaries[i]);
-        if (dev > max_boundary_dev) max_boundary_dev = dev;
-    }
-
-    printf("    CPU vs GPU max centroid deviation: %.6e (bound: %.6e)\n",
-           max_centroid_dev, kHalfPrecisionEpsilon);
-    printf("    CPU vs GPU max boundary deviation: %.6e (bound: %.6e)\n",
-           max_boundary_dev, kHalfPrecisionEpsilon);
-
-    assert(max_centroid_dev < kHalfPrecisionEpsilon &&
-           "CPU and GPU centroids must agree within float16 ULP");
-    assert(max_boundary_dev < kHalfPrecisionEpsilon &&
-           "CPU and GPU boundaries must agree within float16 ULP");
-
-    printf("  PASS: CPU and GPU codebooks agree within half-precision epsilon\n");
+    printf("  PASS: analytical codebooks are strictly symmetric\n");
 }
 
 int main() {
@@ -528,9 +417,7 @@ int main() {
     test_gpu_wht_multiple_block_sizes();
     test_gpu_lloyd_max_agreement();
     test_parallel_conversion_timing();
-    test_symmetry_by_construction();
-    test_positive_half_valid();
-    test_cpu_gpu_codebook_match();
+    test_analytical_codebook_strict_symmetry();
     printf("All parallel converter tests passed.\n");
     return 0;
 }

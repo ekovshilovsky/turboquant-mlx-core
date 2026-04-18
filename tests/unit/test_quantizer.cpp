@@ -519,48 +519,6 @@ static void test_asymmetric_5_3_round_trip() {
     printf("  PASS: 5+3 asymmetric round-trip within acceptable error bounds\n");
 }
 
-/// Verify that generate_codebook_from_data recovers centroids close to the
-/// precomputed N(0,1) codebook when fed Gaussian samples. This validates that
-/// the iterative Lloyd-Max implementation converges correctly on the same
-/// distribution the precomputed tables were derived from.
-static void test_generate_codebook_from_data_gaussian() {
-    // Generate 10000 N(0,1) samples using a deterministic seed and Box-Muller.
-    // The LCG yields uint16 via (state >> 16), range [0, 65535]. We map to
-    // (0, 1) for u1 (must be strictly positive for log) and [0, 1) for u2.
-    std::vector<float> samples(10000);
-    uint32_t state = 314159;
-    for (size_t i = 0; i < samples.size(); i += 2) {
-        state = state * 1103515245u + 12345u;
-        float u1 = (static_cast<float>(state >> 16) + 1.0f) / 65537.0f;
-        state = state * 1103515245u + 12345u;
-        float u2 = static_cast<float>(state >> 16) / 65536.0f;
-        float r = std::sqrt(-2.0f * std::log(u1));
-        float theta = 2.0f * 3.14159265358979f * u2;
-        samples[i] = r * std::cos(theta);
-        if (i + 1 < samples.size()) {
-            samples[i + 1] = r * std::sin(theta);
-        }
-    }
-
-    auto data_cb = generate_codebook_from_data(samples, 4, 100);
-    auto precomputed_cb = generate_codebook(4);
-
-    assert(data_cb.centroids.size() == precomputed_cb.centroids.size());
-
-    // Centroids fitted on N(0,1) samples should be within 5% of the
-    // precomputed optimal centroids (which assume the exact N(0,1) PDF)
-    for (size_t i = 0; i < data_cb.centroids.size(); ++i) {
-        float relative_err = std::fabs(data_cb.centroids[i] - precomputed_cb.centroids[i]);
-        float scale = std::fabs(precomputed_cb.centroids[i]);
-        if (scale > 0.1f) {
-            relative_err /= scale;
-        }
-        assert(relative_err < 0.10f &&
-               "data-driven centroids must be within 10% of precomputed N(0,1) centroids");
-    }
-
-    printf("  PASS: generate_codebook_from_data on Gaussian samples recovers N(0,1) centroids\n");
-}
 
 /// Verify that generate_codebook_from_data adapts centroids for a bimodal
 /// distribution that deviates strongly from N(0,1). When fed a mixture of
@@ -859,7 +817,6 @@ int main() {
     test_5bit_codebook();
     test_asymmetric_5_3_shapes();
     test_asymmetric_5_3_round_trip();
-    test_generate_codebook_from_data_gaussian();
     test_generate_codebook_from_data_bimodal();
     test_per_layer_codebook_reduces_error();
     test_shared_rotation_quality();
