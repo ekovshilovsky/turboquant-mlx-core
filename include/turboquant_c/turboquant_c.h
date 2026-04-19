@@ -1,7 +1,6 @@
 #ifndef TURBOQUANT_C_H
 #define TURBOQUANT_C_H
 
-#include <stdint.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -18,6 +17,7 @@ extern "C" {
 typedef struct tq_model_s* tq_model_t;
 typedef struct tq_kv_cache_s* tq_kv_cache_t;
 typedef struct tq_coordinator_s* tq_coordinator_t;
+typedef struct tq_cluster_s* tq_cluster_t;
 
 /* -- Model API ----------------------------------------------------------- */
 
@@ -84,6 +84,38 @@ int tq_distributed_world_size(tq_coordinator_t coord);
 
 /** Free coordinator resources. Safe to call with NULL. */
 void tq_distributed_free(tq_coordinator_t coord);
+
+/* -- Cluster API --------------------------------------------------------- */
+
+/** Begin building a cluster plan for a model with the given dimensions.
+ *  Returns NULL on failure (e.g., non-positive dimensions). */
+tq_cluster_t tq_cluster_create(int num_layers, int num_heads, int head_dim);
+
+/** Register a discovered peer with its usable memory in GB.
+ *  Returns 0 on success, -1 on failure (e.g., NULL cluster, NULL hostname,
+ *  non-positive memory, or planning already performed). Peers are assigned
+ *  rank values in insertion order starting at 0. */
+int tq_cluster_add_node(tq_cluster_t cluster, const char* hostname, double memory_gb);
+
+/** Compute the memory-aware pipeline-parallel shard plan across all
+ *  previously-added nodes. Must be called exactly once; subsequent calls
+ *  return -1. Returns 0 on success, -1 on failure (NULL cluster, no nodes
+ *  added, or already planned). */
+int tq_cluster_plan(tq_cluster_t cluster);
+
+/** Number of nodes registered. Valid before or after tq_cluster_plan. */
+int tq_cluster_node_count(tq_cluster_t cluster);
+
+/** Inclusive start of the layer range assigned to the given rank. Returns
+ *  -1 before tq_cluster_plan has been called or if rank is out of range. */
+int tq_cluster_get_layer_start(tq_cluster_t cluster, int rank);
+
+/** Exclusive end of the layer range assigned to the given rank. Returns
+ *  -1 before tq_cluster_plan has been called or if rank is out of range. */
+int tq_cluster_get_layer_end(tq_cluster_t cluster, int rank);
+
+/** Release cluster resources. Safe to call with NULL. */
+void tq_cluster_free(tq_cluster_t cluster);
 
 /* -- Dequantization API -------------------------------------------------- */
 
