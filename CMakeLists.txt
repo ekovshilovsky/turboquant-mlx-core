@@ -27,6 +27,9 @@ add_library(turboquant_mlx SHARED
   src/node_state.cpp
   src/cache_snapshot.cpp
   src/convert/shard_metadata.cpp
+  src/convert/safetensors_header.cpp
+  src/convert/shard_strategy.cpp
+  src/convert/emit_sidecar.cpp
 )
 target_include_directories(turboquant_mlx
   PUBLIC
@@ -60,6 +63,9 @@ target_link_libraries(tq-convert PRIVATE turboquant_mlx)
 
 add_executable(tq-dequant tools/tq_dequant_model.cpp)
 target_link_libraries(tq-dequant PRIVATE turboquant_mlx)
+
+add_executable(tq-emit-sidecar tools/tq_emit_sidecar.cpp)
+target_link_libraries(tq-emit-sidecar PRIVATE turboquant_mlx)
 
 # Tests
 option(TQ_BUILD_TESTS "Build tests" ON)
