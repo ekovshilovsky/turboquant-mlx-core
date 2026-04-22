@@ -26,6 +26,7 @@ add_library(turboquant_mlx SHARED
   src/transport.cpp
   src/node_state.cpp
   src/cache_snapshot.cpp
+  src/convert/shard_metadata.cpp
 )
 target_include_directories(turboquant_mlx
   PUBLIC
