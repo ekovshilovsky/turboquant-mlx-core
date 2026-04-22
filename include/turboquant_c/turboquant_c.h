@@ -18,6 +18,7 @@ typedef struct tq_model_s* tq_model_t;
 typedef struct tq_kv_cache_s* tq_kv_cache_t;
 typedef struct tq_coordinator_s* tq_coordinator_t;
 typedef struct tq_cluster_s* tq_cluster_t;
+typedef struct tq_linear_s* tq_linear_t;
 
 /* -- Model API ----------------------------------------------------------- */
 
@@ -117,6 +118,73 @@ int tq_cluster_get_layer_end(tq_cluster_t cluster, int rank);
 /** Release cluster resources. Safe to call with NULL. */
 void tq_cluster_free(tq_cluster_t cluster);
 
+/* -- Shard-aware Linear API ---------------------------------------------- */
+
+/**
+ * Construct a rank-local TurboQuant linear layer from pre-sharded compressed
+ * weight tensors. The three tensor pointers (packed_primary, packed_residual,
+ * norms) are owned by the caller and must remain valid for the duration of
+ * the tq_linear_t handle: the underlying mlx::core::array wrappers are
+ * reconstructed by reference.
+ *
+ * For column-parallel shards pass local_in_features == full_in_features
+ * and supply this rank's slice of the OUTPUT dim: packed_primary and
+ * packed_residual must be [rank_out_features, full_in_features / 2] (4-bit
+ * packed) or [rank_out_features, full_in_features] (5-bit), and norms must
+ * be [rank_out_features]. Seeds (seed_primary, seed_residual) are layer-
+ * global and identical on every rank.
+ *
+ * For row-parallel shards pass local_in_features = full_in_features /
+ * N_ranks (must respect the 9a.1 group-alignment constraint:
+ * full_in_features % (N_ranks * block_size) == 0). Supply this rank's slice
+ * of the INPUT dim: packed_primary and packed_residual must be
+ * [out_features, local_in_features / 2] (4-bit) or [out_features,
+ * local_in_features] (5-bit). norms is broadcast unchanged across ranks.
+ * Seeds are also layer-global.
+ *
+ * packed_primary pointer type: const uint8_t*
+ * packed_residual pointer type: const uint8_t* (may be zero-filled buffer
+ *     when the layer has no residual codebook — same shape as primary's
+ *     packed layout in 4-bit form).
+ * norms pointer type: const float*
+ * primary_codebook / residual_codebook pointer type: const float*, length
+ *     2^primary_bits and 2^residual_bits respectively (typically 16 for
+ *     4-bit, 32 for 5-bit).
+ *
+ * Returns NULL on allocation failure or invalid arguments (non-positive
+ * dimensions, NULL packed_primary, NULL norms, NULL primary_codebook,
+ * primary_bits outside {4, 5}).
+ */
+tq_linear_t tq_linear_create_shard(
+    int full_in_features,
+    int local_in_features,
+    int rank_out_features,
+    int primary_bits,
+    int residual_bits,
+    const void* packed_primary,
+    const void* packed_residual,
+    const void* norms,
+    const void* primary_codebook,
+    const void* residual_codebook,
+    unsigned int seed_primary,
+    unsigned int seed_residual,
+    int block_size);
+
+/**
+ * Forward pass through the shard. input_array is an mlx::core::array*
+ * cast to void*, with shape [batch, local_in_features] and any floating
+ * dtype (cast to float16 internally). Returns a newly allocated
+ * mlx::core::array* of shape [batch, rank_out_features] in float16; the
+ * caller takes ownership and must release it via tq_array_free.
+ *
+ * Returns NULL if layer is NULL, input_array is NULL, or the kernel
+ * dispatch throws an exception at the C++ boundary.
+ */
+void* tq_linear_forward(tq_linear_t layer, const void* input_array);
+
+/** Release the layer's resources. Safe to call with NULL. */
+void tq_linear_free(tq_linear_t layer);
+
 /* -- Dequantization API -------------------------------------------------- */
 
 /**
@@ -131,6 +199,24 @@ int tq_model_dequant(const char* tq_model_path, const char* output_path);
 
 /** Free an array returned by tq_model_forward or tq_kv_cache_* functions. */
 void tq_array_free(void* array);
+
+/**
+ * Allocate a new float32 MLX array from a row-major [rows, cols] buffer.
+ * Returns an mlx::core::array* cast to void*; release via tq_array_free.
+ * Returns NULL on allocation failure or non-positive dimensions. Used by
+ * C-level tests and non-Swift bindings that need to construct input
+ * activations without a direct MLX dependency.
+ */
+void* tq_array_from_fp32(const float* data, int rows, int cols);
+
+/**
+ * Copy a float16 MLX array (as returned by tq_linear_forward or the KV
+ * cache APIs) into a caller-supplied float32 buffer of at least size
+ * rows * cols. out_rows / out_cols must match the array's shape. Returns
+ * 0 on success, -1 on shape mismatch, -1 on NULL inputs, -1 on any
+ * C++-boundary exception. The output buffer is left unmodified on error.
+ */
+int tq_array_copy_to_fp32(const void* array, float* out, int out_rows, int out_cols);
 
 /** Get library version string. */
 const char* tq_version(void);
