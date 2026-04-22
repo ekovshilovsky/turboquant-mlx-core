@@ -1,9 +1,6 @@
 #include "turboquant/converter.h"
 #include "turboquant/codebook.h"
 #include "turboquant/convert/emit_sidecar.h"
-#include "turboquant/convert/safetensors_header.h"
-#include "turboquant/convert/shard_metadata.h"
-#include "turboquant/convert/shard_strategy.h"
 #include "turboquant/quantizer.h"
 #include <mlx/mlx.h>
 #include <atomic>
