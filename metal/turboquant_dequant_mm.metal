@@ -34,9 +34,10 @@ using namespace metal;
 ///   buffer(2)  — codebook_primary : float   [16] for 4-bit or [32] for 5-bit
 ///   buffer(3)  — codebook_residual: float   [16]
 ///   buffer(4)  — norms            : float   [out_features]
-///   buffer(5)  — params           : uint32  [7] {block_sz, out_feat, in_feat,
+///   buffer(5)  — params           : uint32  [8] {block_sz, out_feat, in_feat,
 ///                                                has_resid, seed_primary,
-///                                                seed_residual, primary_bits}
+///                                                seed_residual, primary_bits,
+///                                                full_in_feat}
 ///   buffer(6)  — x                : half    [batch_size, in_features]
 ///   buffer(7)  — y                : half    [batch_size, out_features]
 ///   buffer(8)  — lut              : float   [256] (precomputed primary×residual
@@ -166,11 +167,16 @@ kernel void tq_dequant_mm(
     // in fused_dequant_matmul() (src/dequantizer.cpp):
     //   params[0] = block_size
     //   params[1] = out_features
-    //   params[2] = in_features
-    //   params[3] = has_residual   (0 or 1)
+    //   params[2] = in_features      (rank-local: shard's slice of the input dim)
+    //   params[3] = has_residual     (0 or 1)
     //   params[4] = seed_primary
-    //   params[5] = seed_residual  (0 signals shared-rotation mode)
-    //   params[6] = primary_bits   (4 or 5)
+    //   params[5] = seed_residual    (0 signals shared-rotation mode)
+    //   params[6] = primary_bits     (4 or 5)
+    //   params[7] = full_in_features (original layer's in_features before any
+    //                                 row-parallel shard split; used to keep
+    //                                 combined_scale correct on rank-local
+    //                                 shards. Equal to params[2] for whole-
+    //                                 weight and column-parallel calls.)
     const uint block_sz      = params[0];
     const uint out_feat      = params[1];
     const uint in_feat       = params[2];
@@ -178,6 +184,7 @@ kernel void tq_dequant_mm(
     const uint seed_primary  = params[4];
     const uint seed_residual = params[5];
     const uint primary_bits  = params[6];
+    const uint full_in_feat  = params[7];
     const uint packed_cols   = in_feat / 2;
     const uint num_blocks    = in_feat / block_sz;
 
@@ -193,8 +200,17 @@ kernel void tq_dequant_mm(
     const uint out_row   = gid.x;
     const uint batch_idx = gid.y;
 
-    // Scale factor applied after each WHT: 1/sqrt(in_feat) * 1/sqrt(block_sz)
-    const float combined_scale = rsqrt(float(in_feat)) * rsqrt(float(block_sz));
+    // Scale factor baked into every dequantised weight element.
+    //
+    // The 1/sqrt(full_in_feat) factor inverts the per-row weight
+    // normalisation applied during offline quantisation, which was
+    // computed against the full, unsharded layer. On a row-parallel
+    // shard the kernel sees a smaller rank-local in_feat but must still
+    // scale as if the full layer were present; summing the shards'
+    // partial dot products then reconstructs the whole-weight result.
+    // For whole-weight and column-parallel calls full_in_feat equals
+    // in_feat so the factor is unchanged.
+    const float combined_scale = rsqrt(float(full_in_feat)) * rsqrt(float(block_sz));
 
     threadgroup float shared_buf[BLOCK_SIZE];
 

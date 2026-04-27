@@ -608,7 +608,8 @@ mlx::core::array fused_dequant_matmul(
     const Codebook& primary_codebook,
     const Codebook& residual_codebook,
     uint32_t block_size,
-    const mlx::core::array& input) {
+    const mlx::core::array& input,
+    uint32_t full_in_features) {
 
     // Materialize all compressed weight buffers before reading raw pointers
     mlx::core::eval(qw.packed_primary);
@@ -654,7 +655,16 @@ mlx::core::array fused_dequant_matmul(
 
     // Runtime parameters packed into a uint32 array for the kernel to decode.
     // Layout matches the .metal kernel's params buffer expectation.
+    //
+    // full_in_features defaults to the rank-local in_features whenever the
+    // caller did not specify a different original layer size. The kernel's
+    // combined_scale needs the unsharded value on row-parallel shards so
+    // the per-row norm correction (baked against the whole layer) aligns
+    // with the rank-local dequantised weight values.
     uint32_t primary_bits_val = primary_5bit ? 5u : 4u;
+    uint32_t full_in_feat_val = (full_in_features == 0u)
+        ? static_cast<uint32_t>(in_features)
+        : full_in_features;
     std::vector<uint32_t> param_data = {
         block_size,
         static_cast<uint32_t>(out_features),
@@ -662,9 +672,10 @@ mlx::core::array fused_dequant_matmul(
         has_residual,
         seed_primary,
         seed_residual,
-        primary_bits_val
+        primary_bits_val,
+        full_in_feat_val
     };
-    auto params = mlx::core::array(param_data.data(), {7}, mlx::core::uint32);
+    auto params = mlx::core::array(param_data.data(), {8}, mlx::core::uint32);
 
     // Precompute the 256-entry LUT for shared-rotation 4-bit mode.
     // Each entry holds the sum of one primary centroid and one residual centroid:
@@ -717,6 +728,16 @@ mlx::core::array fused_dequant_matmul(
         {qw.packed_primary, qw.packed_residual, cb_primary, cb_residual,
          qw.norms, params, x, lut_arr});
 
+    // Materialise the output before returning across the C API boundary.
+    // The Swift bridge wraps this array's pointer into its own MLXArray and
+    // links against a separate MLX runtime (mlx-swift's Cmlx) than the one
+    // this dylib links against (Homebrew libmlx). A subsequent eval() called
+    // through the Swift-side runtime does not reach the lazy compute node
+    // scheduled here, leaving the consumer with a freshly allocated but
+    // never-populated buffer (observed as an all-zero output). Forcing
+    // evaluation here keeps the kernel's compute graph local to the runtime
+    // that scheduled it.
+    ::mlx::core::eval(output);
     return output;
 }
 
