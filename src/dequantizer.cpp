@@ -728,6 +728,16 @@ mlx::core::array fused_dequant_matmul(
         {qw.packed_primary, qw.packed_residual, cb_primary, cb_residual,
          qw.norms, params, x, lut_arr});
 
+    // Materialise the output before returning across the C API boundary.
+    // The Swift bridge wraps this array's pointer into its own MLXArray and
+    // links against a separate MLX runtime (mlx-swift's Cmlx) than the one
+    // this dylib links against (Homebrew libmlx). A subsequent eval() called
+    // through the Swift-side runtime does not reach the lazy compute node
+    // scheduled here, leaving the consumer with a freshly allocated but
+    // never-populated buffer (observed as an all-zero output). Forcing
+    // evaluation here keeps the kernel's compute graph local to the runtime
+    // that scheduled it.
+    ::mlx::core::eval(output);
     return output;
 }
 
