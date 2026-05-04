@@ -8,27 +8,40 @@
 namespace fs = std::filesystem;
 
 static void print_usage() {
-    printf("Usage: tq-convert --model <path> [--bits 4] [--residual-bits 4] [--output <path>]\n");
+    printf("Usage: tq-convert --model <path> [--output <path>] [--draft]\n");
     printf("\n");
-    printf("Convert a HuggingFace model to TurboQuant format.\n");
+    printf("Convert a HuggingFace model to TurboQuant format. The default flags\n");
+    printf("produce a release-quality snapshot suitable for serving; use --draft\n");
+    printf("for fast smoke-test conversions during development.\n");
     printf("\n");
     printf("Options:\n");
     printf("  --model <path>            Path to source model directory\n");
-    printf("  --bits <n>                Primary quantization bits (default: 4)\n");
-    printf("  --residual-bits <n>       Residual quantization bits (default: 4, 0 to disable)\n");
-    printf("  --block-size <n>          WHT block size upper bound (default: 512)\n");
+    printf("  --output <path>           Output directory. If omitted, the path is derived\n");
+    printf("                            from the source model basename with a -TQ8-TP{N}\n");
+    printf("                            suffix and placed beside the source directory\n");
+    printf("                            (e.g., Qwen2.5-Coder-3B -> Qwen2.5-Coder-3B-TQ8-TP2).\n");
+    printf("  --draft                   Fast conversion preset for development and CI:\n");
+    printf("                            disables --per-layer-codebooks and sets\n");
+    printf("                            --sensitive-layers 0. Roughly 30x faster but\n");
+    printf("                            10-20x worse perplexity delta. Do not ship to\n");
+    printf("                            users; intended for round-trip smoke tests.\n");
     printf("  --target-world-size <n>   Largest tensor-parallel world size the snapshot\n");
     printf("                            must support; constrains per-layer block sizes so\n");
     printf("                            in_features is divisible by world_size * block_size\n");
     printf("                            (default: 2, matching the common 2-Mac cluster).\n");
     printf("                            Use 1 for max-quality single-Mac snapshots; 4 or\n");
     printf("                            higher for larger clusters.\n");
-    printf("  --sensitive-layers <n>    Keep first and last N transformer layers at fp16 (default: 0)\n");
-    printf("  --per-layer-codebooks     Fit Lloyd-Max codebooks to each layer's distribution\n");
-    printf("  --output <path>           Output directory. If omitted, the path is derived\n");
-    printf("                            from the source model basename with a -TQ8-TP{N}\n");
-    printf("                            suffix and placed beside the source directory\n");
-    printf("                            (e.g., Qwen2.5-Coder-3B -> Qwen2.5-Coder-3B-TQ8-TP2).\n");
+    printf("\n");
+    printf("Advanced overrides (defaults are validated for production use):\n");
+    printf("  --bits <n>                Primary quantization bits (default: 4)\n");
+    printf("  --residual-bits <n>       Residual quantization bits (default: 4, 0 to disable)\n");
+    printf("  --block-size <n>          WHT block size upper bound (default: 512)\n");
+    printf("  --sensitive-layers <n>    Keep first and last N transformer layers at fp16\n");
+    printf("                            (default: 4). Validated for 32B/7B/3B and hybrid\n");
+    printf("                            Qwen3.5 architectures; smaller models can use 2.\n");
+    printf("  --no-per-layer-codebooks  Use a single global Lloyd-Max codebook instead of\n");
+    printf("                            per-layer fits. Faster but increases perplexity\n");
+    printf("                            delta by 10-20x; prefer --draft for quick runs.\n");
     printf("  --version                 Print version and exit\n");
 }
 
@@ -72,9 +85,14 @@ int main(int argc, char* argv[]) {
     int bits = 4;
     int residual_bits = 4;
     int block_size = 512;
-    int sensitive_layers = 0;
+    // Production-quality defaults: 4 sensitive boundary layers and per-layer
+    // Lloyd-Max codebooks. Validated to deliver <1% perplexity delta against
+    // fp16 across Qwen2.5 (3B/7B/32B) and hybrid Qwen3.5 architectures. Users
+    // who need fast iteration pass --draft to flip both off.
+    int sensitive_layers = 4;
     int target_world_size = 2;
-    bool per_layer_codebooks = false;
+    bool per_layer_codebooks = true;
+    bool draft = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -91,7 +109,13 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--sensitive-layers" && i + 1 < argc) {
             sensitive_layers = std::atoi(argv[++i]);
         } else if (arg == "--per-layer-codebooks") {
+            // Retained for backward compatibility; the flag is now the
+            // default and the explicit form is a no-op.
             per_layer_codebooks = true;
+        } else if (arg == "--no-per-layer-codebooks") {
+            per_layer_codebooks = false;
+        } else if (arg == "--draft") {
+            draft = true;
         } else if (arg == "--output" && i + 1 < argc) {
             output_path = argv[++i];
         } else if (arg == "--version") {
@@ -101,6 +125,16 @@ int main(int argc, char* argv[]) {
             print_usage();
             return 0;
         }
+    }
+
+    // --draft is a preset that flips the quality-affecting defaults off for
+    // fast iteration. It is applied after argument parsing, so explicit
+    // per-flag overrides on the same command line lose to --draft regardless
+    // of order; that is intentional — the preset is the authoritative
+    // statement of intent. Topology and bit-width settings are unaffected.
+    if (draft) {
+        sensitive_layers = 0;
+        per_layer_codebooks = false;
     }
 
     if (model_path.empty()) {
@@ -132,8 +166,14 @@ int main(int argc, char* argv[]) {
         printf("[%d/%d] Converting %s\n", current, total, name.c_str());
     };
 
-    printf("Converting: %s -> %s (TQ%d+%d, target_world_size=%d)\n",
-           model_path.c_str(), output_path.c_str(), bits, residual_bits, target_world_size);
+    const char* quality_label = draft
+        ? "draft"
+        : (per_layer_codebooks && sensitive_layers > 0 ? "production" : "custom");
+    printf("Converting: %s -> %s\n", model_path.c_str(), output_path.c_str());
+    printf("  Quality: %s (sensitive_layers=%d, per_layer_codebooks=%s)\n",
+           quality_label, sensitive_layers, per_layer_codebooks ? "yes" : "no");
+    printf("  Format:  TQ%d+%d, target_world_size=%d\n",
+           bits, residual_bits, target_world_size);
 
     if (!turboquant::convert_model(config)) {
         fprintf(stderr, "Error: conversion failed\n");

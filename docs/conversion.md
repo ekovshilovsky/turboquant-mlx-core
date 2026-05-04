@@ -9,20 +9,39 @@ Both tools are built by the top-level CMake target and end up in `build/` alongs
 ### tq-convert — convert a source model to TurboQuant format
 
 ```
-tq-convert --model <source_dir> [--output <dest_dir>] [--bits N]
-          [--residual-bits N] [--block-size N] [--target-world-size N]
-          [--sensitive-layers N] [--per-layer-codebooks]
+tq-convert --model <source_dir> [--output <dest_dir>] [--draft]
+          [--target-world-size N] [--bits N] [--residual-bits N]
+          [--block-size N] [--sensitive-layers N] [--no-per-layer-codebooks]
 ```
 
 Inputs: a HuggingFace-format source model directory containing `config.json`, one or more `*.safetensors` shards, and tokenizer files (`tokenizer.json`, `tokenizer_config.json`, `merges.txt`, `vocab.json`).
 
 Behavior: runs the TurboQuant Lloyd-Max codebook optimization on every 2D `.weight` tensor, writes TQ-encoded safetensors to `<dest_dir>`, copies tokenizer and configuration files verbatim, injects a `quantization_config` block into `config.json`, and writes the `tq_shard_metadata.json` sidecar consumed by distributed-inference loaders.
 
-Example:
+#### Quality defaults
+
+The default flags produce a release-quality snapshot — operators do not need to remember which quality switches to enable:
+
+| Flag                       | Default | Effect                                                                  |
+| -------------------------- | ------- | ----------------------------------------------------------------------- |
+| `--sensitive-layers N`     | `4`     | Keep first/last N transformer layers at fp16 (≈30% perplexity reduction). |
+| `--per-layer-codebooks`    | on      | Fit Lloyd-Max codebooks per layer instead of a single global codebook.  |
+| `--target-world-size N`    | `2`     | Largest TP world size the snapshot must support; common 2-Mac cluster. |
+| `--bits N --residual-bits N` | `4 + 4` | 8-bit-equivalent budget. Validated end-to-end for v1.                |
+
+For development iteration, `--draft` flips the quality flags off:
 
 ```bash
-tq-convert --model ~/turboquant-weights/source/Qwen2.5-Coder-3B \
-           --target-world-size 2
+tq-convert --model ~/turboquant-weights/source/Qwen2.5-Coder-3B --draft
+```
+
+`--draft` is roughly 30x faster to convert but produces 10–20x worse perplexity delta. Use it for round-trip smoke tests, regression checks, and CI; do not ship draft snapshots to users.
+
+Example (production-quality, defaults):
+
+```bash
+tq-convert --model ~/turboquant-weights/source/Qwen2.5-Coder-3B
+# → ~/turboquant-weights/source/Qwen2.5-Coder-3B-TQ8-TP2
 ```
 
 The `tq` dtype tag in the sidecar reflects the total primary + residual bit budget — `--bits 4 --residual-bits 4` produces `tq8` entries.

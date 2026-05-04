@@ -123,22 +123,31 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-### Convert a Model (Optimal Config)
+### Convert a Model
+
+The default invocation produces a release-quality snapshot — no quality flags
+to remember. Output path is auto-derived as `<model>-TQ8-TP{N}` beside the
+source directory.
 
 ```bash
-./build/tq-convert --model /path/to/Qwen3.5-27B \
-  --sensitive-layers 4 \
-  --per-layer-codebooks \
-  --bits 4 --residual-bits 4 \
-  --output /path/to/Qwen3.5-27B-TQ8
+./build/tq-convert --model /path/to/Qwen3.5-27B
+# → /path/to/Qwen3.5-27B-TQ8-TP2
+```
+
+For fast development iteration, the `--draft` preset disables the slow
+quality-affecting passes (~30x faster, 10–20x worse perplexity delta —
+not for shipping):
+
+```bash
+./build/tq-convert --model /path/to/Qwen3.5-27B --draft
 ```
 
 | Flag | Effect | Quality Impact | Speed Impact |
 |---|---|---|---|
-| `--sensitive-layers 4` | Keep first/last 4 layers at fp16 | -30% delta | None (fewer layers to dequant) |
-| `--per-layer-codebooks` | Fit codebooks to each layer | -90% MSE | None (same lookup) |
+| `--sensitive-layers N` | Keep first/last N transformer layers at fp16 (default: 4) | -30% delta | None (fewer layers to dequant) |
+| `--no-per-layer-codebooks` | Use a single global Lloyd-Max codebook | +90% MSE | Faster conversion |
 | `--bits 4 --residual-bits 4` | 4+4 symmetric (default) | Optimal for 8-bit budget | — |
-| `--shared-rotation` | Single WHT pass (opt-in) | +0.1% delta | +40% faster inference |
+| `--target-world-size N` | Largest TP world size the snapshot supports (default: 2) | None | None |
 
 ### Validate Quality
 
