@@ -405,6 +405,91 @@ static void test_sensitive_layer_mixed_precision() {
     printf("  PASS: sensitive layer mixed precision routing\n");
 }
 
+/// Verify that converting a multi-shard input directory produces exactly one
+/// matching output shard for every input shard. Regression test for the
+/// silent shard-drop bug observed during the 2026-05-04 32B TP=4 validation
+/// sweep, where the parallel converter produced 16 of 17 expected output
+/// shards on one run and the conversion still exited 0. The fix requires
+/// `convert_model` to verify input/output parity before declaring success.
+static void test_multi_shard_input_output_parity() {
+    const std::string input_dir  = "/tmp/tq_e2e_parity_input";
+    const std::string output_dir = "/tmp/tq_e2e_parity_output";
+
+    fs::remove_all(input_dir);
+    fs::remove_all(output_dir);
+    fs::create_directories(input_dir);
+
+    const int num_shards = 4;
+    for (int shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
+        std::vector<float> data(32 * 64);
+        for (int i = 0; i < 32 * 64; ++i) {
+            data[static_cast<size_t>(i)] =
+                static_cast<float>((i + shard_idx * 7) % 31 - 15) * 0.05f;
+        }
+        auto weight = mlx::core::array(data.data(), {32, 64});
+
+        std::unordered_map<std::string, mlx::core::array> tensors;
+        const std::string layer_name =
+            "model.layers." + std::to_string(shard_idx) + ".self_attn.q_proj.weight";
+        tensors.insert({layer_name, weight});
+
+        // Use HuggingFace's "model-NNNNN-of-MMMMM.safetensors" naming so the
+        // converter exercises the same shard-discovery code path as a real
+        // multi-shard model directory.
+        char shard_name[64];
+        std::snprintf(shard_name, sizeof(shard_name),
+                      "model-%05d-of-%05d.safetensors",
+                      shard_idx + 1, num_shards);
+        const std::string shard_path = input_dir + "/" + shard_name;
+        mlx::core::save_safetensors(shard_path, tensors);
+        assert(fs::exists(shard_path));
+    }
+
+    turboquant::ConversionConfig config;
+    config.input_path  = input_dir;
+    config.output_path = output_dir;
+    config.quantizer.primary_bits  = 4;
+    config.quantizer.residual_bits = 4;
+    config.quantizer.block_size    = 64;
+    config.quantizer.max_world_size = 1;
+
+    const bool converted = turboquant::convert_model(config);
+    assert(converted &&
+           "convert_model must return true on a well-formed multi-shard input");
+
+    // Every input shard must have a corresponding output shard. This is the
+    // assertion that catches the regression — under the previous code path
+    // a worker race could leave one shard unwritten and convert_model would
+    // still return true.
+    for (int shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
+        char shard_name[64];
+        std::snprintf(shard_name, sizeof(shard_name),
+                      "model-%05d-of-%05d.safetensors",
+                      shard_idx + 1, num_shards);
+        const std::string out_shard = output_dir + "/" + shard_name;
+        assert(fs::exists(out_shard) &&
+               "every input shard must produce a matching output shard");
+    }
+
+    // Independently verify the recovery path: deleting an output shard after
+    // a successful conversion and re-running with the same ConversionConfig
+    // must replace the missing shard rather than skip it.
+    const std::string victim = output_dir + "/model-00002-of-00004.safetensors";
+    fs::remove(victim);
+    assert(!fs::exists(victim));
+
+    const bool reconverted = turboquant::convert_model(config);
+    assert(reconverted &&
+           "re-running convert_model must successfully replace a missing output shard");
+    assert(fs::exists(victim) &&
+           "the previously-missing output shard must be regenerated");
+
+    fs::remove_all(input_dir);
+    fs::remove_all(output_dir);
+
+    printf("  PASS: multi-shard input/output parity\n");
+}
+
 int main() {
     printf("test_converter_e2e (integration):\n");
     test_tiny_model_convert_load_forward();
@@ -412,6 +497,7 @@ int main() {
     test_metadata_format();
     test_non_power_of_2_conversion();
     test_sensitive_layer_mixed_precision();
+    test_multi_shard_input_output_parity();
     printf("All converter e2e integration tests passed.\n");
     return 0;
 }

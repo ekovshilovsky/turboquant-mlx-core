@@ -424,8 +424,19 @@ bool convert_model(const ConversionConfig& config) {
         // Collect results from all parallel workers and merge into the shard's
         // output maps. Futures are consumed in submission order; each .get()
         // blocks until its worker completes, propagating any exceptions.
+        // An empty `qw` indicates the worker returned without producing output —
+        // we fail loud here rather than silently dereferencing the optional and
+        // emitting a default-constructed weight. Catching this at merge time
+        // surfaces converter races immediately instead of letting them ship a
+        // shard short of tensors.
         for (auto& f : futures) {
             auto result = f.get();
+            if (!result.qw.has_value()) {
+                throw std::runtime_error(
+                    "internal error: quantization worker returned no result for layer '" +
+                    result.layer_name + "' in shard '" + shard_path.filename().string() +
+                    "'. This indicates a converter race; please re-run.");
+            }
             quantized_weights.insert({result.layer_name, std::move(*result.qw)});
             if (result.has_per_layer_cb) {
                 shard_layer_codebooks.insert(
@@ -462,6 +473,24 @@ bool convert_model(const ConversionConfig& config) {
     // shard-aware weight loader. This is a pure post-write pass — it only
     // reads the safetensors headers already persisted above.
     write_shard_metadata_file(config);
+
+    // Verify input/output shard parity before declaring success. The convert
+    // loop above is the only path that writes per-shard outputs; any input
+    // shard without a matching output indicates a silent skip (worker race,
+    // swallowed exception, filesystem race) that the validator's shape-only
+    // check would not catch. Failing here surfaces the bug at conversion
+    // time instead of at downstream load time, where the operator sees an
+    // opaque "Missing N parameters" error from the model loader.
+    for (const auto& input_shard : safetensors_files) {
+        const fs::path expected = fs::path(config.output_path) / input_shard.filename();
+        if (!fs::exists(expected)) {
+            fprintf(stderr,
+                    "Error: input shard '%s' produced no corresponding output at '%s'. "
+                    "Conversion is incomplete and must be re-run.\n",
+                    input_shard.filename().c_str(), expected.c_str());
+            return false;
+        }
+    }
 
     return true;
 }
