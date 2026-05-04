@@ -10,8 +10,8 @@ Both tools are built by the top-level CMake target and end up in `build/` alongs
 
 ```
 tq-convert --model <source_dir> [--output <dest_dir>] [--bits N]
-          [--residual-bits N] [--block-size N] [--sensitive-layers N]
-          [--per-layer-codebooks]
+          [--residual-bits N] [--block-size N] [--target-world-size N]
+          [--sensitive-layers N] [--per-layer-codebooks]
 ```
 
 Inputs: a HuggingFace-format source model directory containing `config.json`, one or more `*.safetensors` shards, and tokenizer files (`tokenizer.json`, `tokenizer_config.json`, `merges.txt`, `vocab.json`).
@@ -22,11 +22,34 @@ Example:
 
 ```bash
 tq-convert --model ~/turboquant-weights/source/Qwen2.5-Coder-3B \
-           --output ~/turboquant-weights/converted/Qwen2.5-Coder-3B-TQ8 \
-           --bits 4 --residual-bits 4
+           --target-world-size 2
 ```
 
 The `tq` dtype tag in the sidecar reflects the total primary + residual bit budget — `--bits 4 --residual-bits 4` produces `tq8` entries.
+
+#### Output directory naming
+
+When `--output` is omitted, the output directory is derived from the source model basename with a `-TQ8-TP{N}` suffix and placed beside the source directory. The naming mirrors AWQ's `<model>-AWQ-INT4-G128` convention so the topology capability of the snapshot is visible in both the local directory name and any downstream HuggingFace repo name. Examples:
+
+| Source                                              | `--target-world-size` | Output                                                     |
+| --------------------------------------------------- | --------------------- | ---------------------------------------------------------- |
+| `~/turboquant-weights/source/Qwen2.5-Coder-3B`      | 2 (default)           | `~/turboquant-weights/source/Qwen2.5-Coder-3B-TQ8-TP2`     |
+| `~/turboquant-weights/source/Qwen2.5-Coder-3B`      | 4                     | `~/turboquant-weights/source/Qwen2.5-Coder-3B-TQ8-TP4`     |
+| `~/turboquant-weights/source/Qwen2.5-Coder-3B`      | 1                     | `~/turboquant-weights/source/Qwen2.5-Coder-3B-TQ8-TP1`     |
+
+The `TQ8` token is shorthand for "TurboQuant 8-bit-equivalent" (4 primary + 4 residual bits) and is hardcoded for v1 because that is the only configuration validated end-to-end. Pass `--output` explicitly to override the derived path.
+
+#### Choosing `--target-world-size`
+
+`--target-world-size` is the largest tensor-parallel world size the produced snapshot is guaranteed to support. The flag is named to align with vLLM's `tensor-parallel-size` and AWQ/GPTQ's group-size flags. It constrains per-layer block-size auto-selection so `(world_size * block_size)` divides each weight's input dimension evenly — required for row-parallel sharding. Larger values trade a small amount of per-layer quality for the ability to shard across more ranks.
+
+| Cluster | `--target-world-size` | Notes                                                       |
+| ------- | --------------------- | ----------------------------------------------------------- |
+| 1 Mac   | 1                     | Max-quality single-Mac snapshot, no tensor parallelism.     |
+| 2 Macs  | 2 (default)           | Reasonable per-layer quality, supports up to 2 ranks.       |
+| 4 Macs  | 4                     | Slightly lower per-layer quality, supports up to 4 ranks.   |
+
+Snapshots converted with a smaller `--target-world-size` than the runtime cluster's actual size will be rejected at SwiftLM's cluster bring-up: the loader reads `max_supported_world_size` from `tq_shard_metadata.json` and surfaces an actionable error like "this fixture supports up to 2 ranks; re-convert with --target-world-size 4".
 
 ### tq-emit-sidecar — generate the sidecar for an existing TQ-converted model
 
@@ -56,8 +79,9 @@ The sidecar is a small JSON document (one entry per logical tensor, no weight pa
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "model_architecture": "qwen2",
+  "max_supported_world_size": 2,
   "hidden_size": 2048,
   "num_attention_heads": 16,
   "intermediate_size": 11008,
@@ -79,7 +103,11 @@ The sidecar is a small JSON document (one entry per logical tensor, no weight pa
 
 SwiftLM's distributed-inference loader reads this sidecar to decide, for every tensor, whether to broadcast it to all ranks (`shard_strategy = replicated`, `shard_axis = null`) or slice it along a specific axis (`column_parallel` / `row_parallel` / `expert_parallel`) without re-parsing the TurboQuant packed on-disk layout.
 
+`max_supported_world_size` is the highest tensor-parallel world size the snapshot was built for; SwiftLM checks the runtime cluster size against this value at bring-up and refuses to load when the runtime size exceeds it. Re-convert with a larger `--target-world-size` to support larger clusters.
+
 MoE models also carry `num_experts` and `top_k` at the document root.
+
+Schema version 2 added the `max_supported_world_size` top-level field. Older converted directories read by `tq-emit-sidecar` will be re-emitted at version 2 with `max_supported_world_size: 1` (no tensor parallelism) when the source `config.json` does not record a `max_world_size` value.
 
 ## Shard-strategy inference rules
 

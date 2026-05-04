@@ -170,6 +170,7 @@ bool convert_model(const ConversionConfig& config) {
                     "    \"bits\": " + std::to_string(config.quantizer.primary_bits) + ",\n"
                     "    \"residual_bits\": " + std::to_string(config.quantizer.residual_bits) + ",\n"
                     "    \"block_size\": " + std::to_string(config.quantizer.block_size) + ",\n"
+                    "    \"max_world_size\": " + std::to_string(config.quantizer.max_world_size) + ",\n"
                     "    \"shared_rotation\": " + (config.quantizer.shared_rotation ? "true" : "false") + ",\n"
                     "    \"sensitive_layers_start\": " + std::to_string(config.quantizer.sensitive_layers_start) + ",\n"
                     "    \"sensitive_layers_end\": " + std::to_string(config.quantizer.sensitive_layers_end) + "\n"
@@ -246,13 +247,24 @@ bool convert_model(const ConversionConfig& config) {
                 // evenly. WHT requires full blocks — a remainder means unrotated
                 // columns quantized with a codebook optimized for rotated
                 // coordinates, producing catastrophic quality loss.
+                //
+                // When max_world_size > 1 the snapshot is intended to feed a
+                // tensor-parallel cluster. Row-parallel sharding splits the
+                // in_features axis evenly across ranks, so the chosen block
+                // size must also divide in_features / max_world_size; equivalently
+                // (max_world_size * block_size) must divide in_features. For
+                // max_world_size == 1 this reduces to the existing constraint.
                 QuantizerConfig layer_config = config.quantizer;
-                int in_feat = static_cast<int>(fp32_tensor.shape(1));
+                const int in_feat = static_cast<int>(fp32_tensor.shape(1));
+                const uint32_t world_factor =
+                    layer_config.max_world_size > 0 ? layer_config.max_world_size : 1u;
                 uint32_t best_bs = 1;
                 for (int p = 1; p < 20; ++p) {
                     uint32_t c = 1u << p;
                     if (c > layer_config.block_size) break;
-                    if (in_feat % static_cast<int>(c) == 0) best_bs = c;
+                    if (in_feat % static_cast<int>(c) != 0) continue;
+                    if (in_feat % static_cast<int>(world_factor * c) != 0) continue;
+                    best_bs = c;
                 }
                 layer_config.block_size = best_bs;
 
@@ -322,7 +334,7 @@ bool convert_model(const ConversionConfig& config) {
 
                         // Normalize rows by L2 norm (matching quantizer.cpp pipeline)
                         auto sq = mlx::core::multiply(job.fp32_tensor, job.fp32_tensor);
-                        auto row_sum = mlx::core::sum(sq, {1}, true);
+                        auto row_sum = mlx::core::sum(sq, /* axis= */ 1, /* keepdims= */ true);
                         auto row_norms = mlx::core::sqrt(row_sum);
                         auto safe_norms = mlx::core::maximum(row_norms, mlx::core::array(1e-10f));
                         auto w_norm = mlx::core::divide(job.fp32_tensor, safe_norms);

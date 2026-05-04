@@ -107,7 +107,8 @@ static fs::path build_fixture_dir(const std::string& suffix) {
 
     // Minimal HF-style config.json. Includes the quantization_config block
     // that tq-convert injects so the retrofit tool can synthesize the tq8
-    // dtype tag from bits + residual_bits.
+    // dtype tag from bits + residual_bits and surface the snapshot's
+    // tensor-parallel capability via max_world_size.
     const std::string config_json = R"({
   "architectures": ["Qwen2ForCausalLM"],
   "model_type": "qwen2",
@@ -122,6 +123,7 @@ static fs::path build_fixture_dir(const std::string& suffix) {
     "bits": 4,
     "residual_bits": 4,
     "block_size": 512,
+    "max_world_size": 2,
     "shared_rotation": false,
     "sensitive_layers_start": 0,
     "sensitive_layers_end": 0
@@ -158,8 +160,9 @@ static void test_retrofit_emits_correct_strategies_and_offsets() {
                                std::istreambuf_iterator<char>());
 
     // Schema version and model-level attributes from config.json.
-    assert(contains(json_str, "\"format_version\": 1"));
+    assert(contains(json_str, "\"format_version\": 2"));
     assert(contains(json_str, "\"model_architecture\": \"qwen2\""));
+    assert(contains(json_str, "\"max_supported_world_size\": 2"));
     assert(contains(json_str, "\"hidden_size\": 2048"));
     assert(contains(json_str, "\"num_attention_heads\": 16"));
     assert(contains(json_str, "\"intermediate_size\": 11008"));

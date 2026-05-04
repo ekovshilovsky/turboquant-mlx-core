@@ -50,6 +50,7 @@ void ShardMetadata::set_num_attention_heads(int32_t n) { num_attention_heads_ = 
 void ShardMetadata::set_intermediate_size(int64_t i) { intermediate_size_ = i; }
 void ShardMetadata::set_num_experts(int32_t n) { num_experts_ = n; }
 void ShardMetadata::set_top_k(int32_t k) { top_k_ = k; }
+void ShardMetadata::set_max_supported_world_size(int32_t n) { max_supported_world_size_ = n; }
 
 std::string ShardMetadata::to_json_string() const {
     // The document is small enough that building it with a string stream keeps
@@ -60,6 +61,7 @@ std::string ShardMetadata::to_json_string() const {
     os << "{\n";
     os << "  \"format_version\": " << FORMAT_VERSION << ",\n";
     os << "  \"model_architecture\": " << json_quoted(architecture_) << ",\n";
+    os << "  \"max_supported_world_size\": " << max_supported_world_size_ << ",\n";
     os << "  \"hidden_size\": " << hidden_size_ << ",\n";
     os << "  \"num_attention_heads\": " << num_attention_heads_;
     if (intermediate_size_ > 0) {

@@ -206,6 +206,11 @@ static void test_non_power_of_2_conversion() {
     config.quantizer.primary_bits  = 4;
     config.quantizer.residual_bits = 4;
     config.quantizer.block_size    = 128;  // Adaptive block_size for 896 = 7 x 128
+    // Pin to single-rank so the chosen block_size depends only on in_features.
+    // The default targets a 2-rank cluster, which would add a stricter
+    // (2 * block_size) | in_features constraint and force a smaller block_size
+    // for 896-column matrices.
+    config.quantizer.max_world_size = 1;
 
     bool converted = turboquant::convert_model(config);
     assert(converted && "convert_model must succeed on 64x896 non-power-of-2 input");

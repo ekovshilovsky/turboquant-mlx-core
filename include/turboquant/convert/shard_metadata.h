@@ -42,13 +42,21 @@ public:
     void set_num_experts(int32_t n);
     void set_top_k(int32_t k);
 
+    /// Maximum tensor-parallel world size the converted snapshot supports,
+    /// as recorded by the convert tool. SwiftLM's cluster bring-up reads
+    /// this field so it can fail fast with an actionable error when the
+    /// requested world size exceeds what the snapshot was built for, rather
+    /// than discovering the mismatch through a runtime sharding precondition.
+    void set_max_supported_world_size(int32_t n);
+
     /// Serialize the accumulated metadata as a pretty-printed JSON document.
     /// Stable key ordering keeps diffs reviewable and comparisons deterministic.
     std::string to_json_string() const;
 
     /// Schema version. Bump whenever the JSON structure changes in a way that
     /// would require readers to update; additive optional fields do not bump it.
-    static constexpr int FORMAT_VERSION = 1;
+    /// Version 2 introduced the `max_supported_world_size` top-level field.
+    static constexpr int FORMAT_VERSION = 2;
 
 private:
     std::string architecture_;
@@ -57,6 +65,7 @@ private:
     int64_t intermediate_size_ = 0;
     int32_t num_experts_ = 0;
     int32_t top_k_ = 0;
+    int32_t max_supported_world_size_ = 1;
     std::vector<TensorEntry> tensors_;
 };
 

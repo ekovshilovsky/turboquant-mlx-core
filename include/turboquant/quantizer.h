@@ -3,7 +3,6 @@
 #include <mlx/mlx.h>
 #include "codebook.h"
 #include <cstdint>
-#include <string>
 
 namespace turboquant {
 
@@ -16,6 +15,17 @@ struct QuantizerConfig {
     bool norm_correction = true;    ///< Apply corrected row norms
     int sensitive_layers_start = 0; ///< First N layers kept at fp16 (0 = none)
     int sensitive_layers_end = 0;   ///< Last N layers kept at fp16 (0 = none)
+    /// Maximum tensor-parallel world size the produced snapshot is guaranteed
+    /// to support. When > 1, per-layer block-size auto-selection adds the
+    /// constraint (max_world_size * block_size) | in_features so row-parallel
+    /// sharding in TurboQuantShardedToAllLinear can split each weight evenly
+    /// across ranks. The default targets the common 2-Mac cluster topology;
+    /// operators with specialized needs override explicitly:
+    ///   * 1 — single-Mac max-quality snapshot, no tensor parallelism.
+    ///   * 2 — default; reasonable per-layer quality, supports up to 2 ranks.
+    ///   * 4+ — larger clusters; trades a small amount of per-layer quality
+    ///     for the ability to shard across more ranks.
+    uint32_t max_world_size = 2;
 };
 
 /// Result of quantizing a single weight matrix.

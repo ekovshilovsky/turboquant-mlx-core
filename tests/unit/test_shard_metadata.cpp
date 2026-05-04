@@ -32,10 +32,13 @@ static void test_emits_required_fields_for_column_parallel() {
     md.set_hidden_size(2048);
     md.set_num_attention_heads(16);
 
+    md.set_max_supported_world_size(2);
+
     const std::string json_str = md.to_json_string();
 
-    assert(contains(json_str, "\"format_version\": 1"));
+    assert(contains(json_str, "\"format_version\": 2"));
     assert(contains(json_str, "\"model_architecture\": \"qwen2\""));
+    assert(contains(json_str, "\"max_supported_world_size\": 2"));
     assert(contains(json_str, "\"hidden_size\": 2048"));
     assert(contains(json_str, "\"num_attention_heads\": 16"));
     assert(contains(json_str, "\"model.layers.0.self_attn.q_proj.weight\""));

@@ -149,6 +149,14 @@ EmitSidecarResult emit_sidecar_for_directory(const fs::path& converted_dir) {
         tq_dtype = "tq" + std::to_string(primary_bits + residual_bits);
     }
 
+    // Surface the snapshot's tensor-parallel capability so SwiftLM's cluster
+    // bring-up can fail fast with an actionable error when an operator points
+    // a larger cluster at a snapshot built for fewer ranks. Older converted
+    // directories that predate the field default to 1 (no tensor parallelism).
+    const int64_t max_world_size =
+        extract_config_int(config_json, "max_world_size", 1);
+    md.set_max_supported_world_size(static_cast<int32_t>(max_world_size));
+
     // Walk every safetensors shard and extract both TQ-coded logical weights
     // and passthrough tensors. The traversal mirrors the post-write pass in
     // the converter so the retrofit path and the inline path produce
